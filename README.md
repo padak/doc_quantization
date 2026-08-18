@@ -147,22 +147,51 @@ All tunables live in `config/config.json`:
 
 ## Privacy model, honestly
 
-Decontextualization reduces context exposure; it does not eliminate it:
+This pipeline is built to survive an assume-breach argument. The question it
+answers is not "do we trust the provider?" but "what would the provider hold
+if it ignored every contract and kept everything we ever sent?".
 
-- The provider still reads the names themselves — that is the essence of the
-  detection task. What it never receives is the full document, its identity,
-  or the chunk ordering.
-- All chunks are submitted from one account, so "these fragments belong
-  together" is observable; "in what order, forming what, and which of them
-  are even real" is not — half of the traffic is chaff.
-- Each detection request exposes at most `chunk_size + 2 * margin` tokens of
-  contiguous text (38 tokens with the defaults).
-- A worst-case retained copy of the traffic is diluted 1:1 with synthetic
-  fragments only the local registry can subtract, and it is booby-trapped:
-  `canary-probe` turns suspected training misuse into a measurable event.
+### Worst case: the provider retains all traffic
 
-If you need stronger guarantees, run a local NER model instead — nothing
-leaves the machine and this pipeline is unnecessary.
+Even then, it holds:
+
+- **Fragments, not documents.** Isolated snippets of roughly `chunk_size`
+  tokens of contiguous text (~22 with the defaults), stripped of filenames,
+  titles, authorship and any document identity.
+- **A shuffled pool under meaningless IDs.** Chunk ordering lives only in the
+  local database and is never transmitted; the random UUIDs encode nothing.
+- **A corpus that is half fake.** Chaff is mixed 1:1 and is indistinguishable
+  from real fragments by request shape. Only the local registry can subtract
+  it — a retained copy is polluted beyond trustworthy use.
+- **Fifty tripwires.** Globally unique fabricated facts are seeded into the
+  traffic continuously. `canary-probe` later asks models about them; a model
+  that "knows" a canary is evidence of training misuse. The no-training
+  clause stops being a promise and becomes a testable claim.
+- **An audit trail working for you.** Honeytokens turn every batch into a
+  measurement: a recall figure per batch and model that you can put in front
+  of a regulator or an auditor instead of an assurance.
+
+### What it does not hide
+
+- **Unknown names must travel** — finding them is the job. What never has to
+  travel are names you already know (roadmap: a local-first detection pass so
+  known entities are pre-redacted before anything leaves the machine).
+- **Co-membership.** All fragments arrive from one account, so "these belong
+  to the same client" is observable; what they form is not.
+- **Reassembly is a statistical fight, not a lookup.** Outbound fragments are
+  mutually disjoint — chunk cuts are name-aware, so no overlap seams exist to
+  chain them. What remains for an adversary is linguistic stitching of
+  22-token crumbs across a shuffled, half-fake pool. Residual risk: names
+  that defy capitalization conventions, or capitalized runs longer than the
+  extension cap, can still straddle a cut.
+- **This is not GDPR anonymization.** Fragments containing real names remain
+  personal data. The pipeline delivers data minimization and unlinkability on
+  top of your DPA — it complements the contract, it does not replace it.
+
+In one sentence: even in the scenario your lawyers fear most, the adversary
+ends up with a shuffled, half-fabricated pile of disjoint 22-token crumbs,
+no way to tell real from fake, and fifty landmines that convert cheating
+into evidence.
 
 ## Known limitations
 
