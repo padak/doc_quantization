@@ -26,7 +26,10 @@ class ConfigError(Exception):
 class ChunkingConfig:
     chunk_size_tokens: int
     encoding: str
-    detection_margin_tokens: int
+    # How far a chunk boundary may be pushed so that it never cuts through a
+    # run of capitalized words; chunks are the detection unit, so a name has to
+    # fit inside one of them.
+    name_run_max_extension_tokens: int
 
 
 @dataclass(frozen=True)
@@ -127,8 +130,8 @@ def load_config(path: Path | None = None) -> AppConfig:
     chunking = ChunkingConfig(
         chunk_size_tokens=int(_require(raw["chunking"], "chunk_size_tokens", "chunking")),
         encoding=_require(raw["chunking"], "encoding", "chunking"),
-        detection_margin_tokens=int(
-            _require(raw["chunking"], "detection_margin_tokens", "chunking")
+        name_run_max_extension_tokens=int(
+            _require(raw["chunking"], "name_run_max_extension_tokens", "chunking")
         ),
     )
     db_path = Path(_require(raw["database"], "path", "database"))

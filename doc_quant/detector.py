@@ -3,9 +3,11 @@
 Every chunk is submitted as an isolated fragment under its random chunk id:
 no document identity, no ordering, no neighbour identity. The request list is
 shuffled before submission so that even the position of a request inside the
-batch carries no information about the document it came from. The only context
-a chunk gets is a few margin tokens of adjacent text, which is needed so that a
-name split across a chunk boundary can still be recognised.
+batch carries no information about the document it came from. A chunk gets no
+context at all: what is sent is exactly the stored text, so the fragments of a
+document are disjoint and cannot be re-stitched by matching overlapping seams.
+Names survive the cuts because the chunker refuses to cut through one (see
+`doc_quant.chunker`).
 
 Outbound batches are additionally mixed with synthetic fragments (see
 `doc_quant.synthetic`):
@@ -171,20 +173,11 @@ class Detector:
             logger.info("No unsubmitted chunks found")
             return None
 
-        # Fetch each document's ordered texts once; the window is built from
-        # them but only the window itself leaves this process.
-        document_texts: dict[str, list[str]] = {}
-        requests: list[Request] = []
-        for chunk in chunks:
-            doc_id = chunk["doc_id"]
-            if doc_id not in document_texts:
-                document_texts[doc_id] = self._store.get_document_chunk_texts(doc_id)
-            window_text = self._chunker.window(
-                document_texts[doc_id],
-                chunk["seq"],
-                self._config.chunking.detection_margin_tokens,
-            )
-            requests.append(self._build_request(chunk["chunk_id"], window_text))
+        # The chunk's own text is the whole request: no neighbour context, so
+        # neighbouring requests share no text an outsider could match on.
+        requests: list[Request] = [
+            self._build_request(chunk["chunk_id"], chunk["text"]) for chunk in chunks
+        ]
 
         synthetic_fragments = self._make_synthetic_fragments(len(chunks))
         for fragment in synthetic_fragments:

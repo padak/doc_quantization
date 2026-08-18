@@ -516,7 +516,11 @@ def _dispatch(args: argparse.Namespace) -> int:
     config = load_config()
     store = ChunkStore(config.database.path)
     try:
-        chunker = Chunker(config.chunking.encoding, config.chunking.chunk_size_tokens)
+        chunker = Chunker(
+            config.chunking.encoding,
+            config.chunking.chunk_size_tokens,
+            config.chunking.name_run_max_extension_tokens,
+        )
         detector = Detector(config, store, chunker)
 
         if args.command == "ingest":
