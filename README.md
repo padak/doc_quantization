@@ -128,7 +128,7 @@ All tunables live in `config/config.json`:
 | --- | --- | --- |
 | `chunking.chunk_size_tokens` | `22` | Tokens per stored chunk |
 | `chunking.encoding` | `cl100k_base` | tiktoken encoding |
-| `chunking.detection_margin_tokens` | `8` | Neighbor context sent with each detection request (never stored) |
+| `chunking.name_run_max_extension_tokens` | `12` | Max extra tokens a cut may move so it never splits a capitalized name run |
 | `anthropic.model` | `claude-opus-5` | Detection model |
 | `anthropic.effort` | `low` | Reasoning effort for detection requests |
 | `anthropic.max_tokens` | `1024` | Max output tokens per request |

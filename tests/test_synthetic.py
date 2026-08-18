@@ -74,7 +74,7 @@ def make_config(tmp_path: Path, **synthetic_overrides) -> AppConfig:
         chunking=ChunkingConfig(
             chunk_size_tokens=22,
             encoding="cl100k_base",
-            detection_margin_tokens=8,
+            name_run_max_extension_tokens=12,
         ),
         database=DatabaseConfig(path=tmp_path / "chunks.db"),
         anthropic=AnthropicConfig(model="claude-opus-5", effort="low", max_tokens=1024),
@@ -165,7 +165,7 @@ def test_missing_synthetic_section_fails_fast(tmp_path: Path) -> None:
                 "chunking": {
                     "chunk_size_tokens": 22,
                     "encoding": "cl100k_base",
-                    "detection_margin_tokens": 8,
+                    "name_run_max_extension_tokens": 12,
                 },
                 "database": {"path": "data/chunks.db"},
                 "anthropic": {

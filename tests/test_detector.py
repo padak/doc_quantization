@@ -15,7 +15,6 @@ from doc_quant.detector import DETECTION_SYSTEM_PROMPT, ENTITY_SCHEMA, Detector
 MODEL = "claude-opus-5"
 EFFORT = "low"
 MAX_TOKENS = 1024
-MARGIN_TOKENS = 8
 
 
 def make_config() -> SimpleNamespace:
@@ -28,7 +27,7 @@ def make_config() -> SimpleNamespace:
         chunking=SimpleNamespace(
             chunk_size_tokens=22,
             encoding="cl100k_base",
-            detection_margin_tokens=MARGIN_TOKENS,
+            name_run_max_extension_tokens=12,
         ),
         anthropic=SimpleNamespace(model=MODEL, effort=EFFORT, max_tokens=MAX_TOKENS),
         synthetic=SimpleNamespace(
@@ -84,10 +83,15 @@ class FakeStore:
 
 
 class FakeChunker:
-    """Window builder that makes the applied margin visible in the output."""
+    """Chunker stand-in.
 
-    def window(self, chunk_texts: list[str], index: int, margin_tokens: int) -> str:
-        return f"<-{margin_tokens}-{chunk_texts[index]}-{margin_tokens}->"
+    Submission no longer asks the chunker for anything: a request carries the
+    stored chunk text verbatim. The parameter is kept so the wiring of the real
+    Detector is exercised, and any call would be a regression.
+    """
+
+    def __getattr__(self, name: str):
+        raise AssertionError(f"Detector must not call chunker.{name} during submission")
 
 
 class FakeBatches:
@@ -197,7 +201,7 @@ def test_submit_uses_configured_model_effort_and_schema(two_chunk_store):
         }
 
 
-def test_submit_sends_windowed_text_and_no_document_identity(two_chunk_store):
+def test_submit_sends_the_stored_chunk_text_and_no_document_identity(two_chunk_store):
     client = FakeClient()
     make_detector(two_chunk_store, client).submit()
 
@@ -205,8 +209,10 @@ def test_submit_sends_windowed_text_and_no_document_identity(two_chunk_store):
         request["custom_id"]: request["params"]["messages"][0]["content"]
         for request in client.batches.create_calls[0]
     }
-    assert by_id["chunk-a"] == f"<-{MARGIN_TOKENS}-alpha-{MARGIN_TOKENS}->"
-    assert by_id["chunk-b"] == f"<-{MARGIN_TOKENS}-beta-{MARGIN_TOKENS}->"
+    # Exactly the stored text: no margin, so neighbouring requests share no
+    # text that could be used to re-stitch the document.
+    assert by_id["chunk-a"] == "alpha"
+    assert by_id["chunk-b"] == "beta"
 
     # No request may leak the document id or the chunk's position.
     serialized = json.dumps(client.batches.create_calls[0], default=str)
@@ -214,17 +220,19 @@ def test_submit_sends_windowed_text_and_no_document_identity(two_chunk_store):
     assert "seq" not in serialized
 
 
-def test_submit_fetches_each_documents_texts_once():
+def test_submit_never_reads_a_documents_ordered_texts():
     store = FakeStore(
         unsubmitted=[
-            {"chunk_id": "a", "doc_id": "doc-1", "seq": 0},
-            {"chunk_id": "b", "doc_id": "doc-1", "seq": 1},
-            {"chunk_id": "c", "doc_id": "doc-2", "seq": 0},
+            {"chunk_id": "a", "doc_id": "doc-1", "seq": 0, "text": "one"},
+            {"chunk_id": "b", "doc_id": "doc-1", "seq": 1, "text": "two"},
+            {"chunk_id": "c", "doc_id": "doc-2", "seq": 0, "text": "three"},
         ],
         document_texts={"doc-1": ["one", "two"], "doc-2": ["three"]},
     )
     make_detector(store, FakeClient()).submit()
-    assert sorted(store.document_text_calls) == ["doc-1", "doc-2"]
+
+    # Ordered texts were only ever needed to build windows.
+    assert store.document_text_calls == []
 
 
 def test_submit_records_batch_and_marks_chunks(two_chunk_store):

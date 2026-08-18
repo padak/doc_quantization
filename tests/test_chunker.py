@@ -3,6 +3,14 @@
 The critical property is lossless reconstruction: joining the chunks of any
 input must reproduce that input byte for byte, including Czech diacritics,
 emoji and CJK text whose UTF-8 encoding spans several bytes per character.
+
+The second property is that a cut never falls inside a run of capitalized
+words, so that a name always lies wholly inside one chunk and detection needs
+no context from the neighbouring fragments. The texts below are engineered so
+that the *tentative* cut - the plain `CHUNK_SIZE`-token boundary - lands in a
+specific spot; `tentative_cut` asserts that engineering still holds, so a
+future tokenizer change turns into a clear failure rather than a test that
+silently stops testing anything.
 """
 
 from __future__ import annotations
@@ -14,7 +22,7 @@ from doc_quant.chunker import Chunker
 
 ENCODING = "cl100k_base"
 CHUNK_SIZE = 22
-MARGIN = 8
+MAX_EXTENSION = 12
 
 ENGLISH_MARKDOWN = (
     "# Release notes\n\n"
@@ -50,7 +58,30 @@ SAMPLE_TEXTS = {
 
 @pytest.fixture(scope="module")
 def chunker() -> Chunker:
-    return Chunker(encoding_name=ENCODING, chunk_size=CHUNK_SIZE)
+    return Chunker(
+        encoding_name=ENCODING,
+        chunk_size=CHUNK_SIZE,
+        name_run_max_extension_tokens=MAX_EXTENSION,
+    )
+
+
+def token_counts(texts: list[str]) -> list[int]:
+    encoding = tiktoken.get_encoding(ENCODING)
+    return [len(encoding.encode(text, disallowed_special=())) for text in texts]
+
+
+def tentative_cut(text: str) -> tuple[str, str]:
+    """Return the text before and after the plain `CHUNK_SIZE`-token boundary."""
+    encoding = tiktoken.get_encoding(ENCODING)
+    tokens = encoding.encode(text, disallowed_special=())
+    assert len(tokens) > CHUNK_SIZE, "sample must be longer than one chunk"
+    return encoding.decode(tokens[:CHUNK_SIZE]), encoding.decode(tokens[CHUNK_SIZE:])
+
+
+def chunk_containing(chunks: list[str], needle: str) -> str:
+    matches = [text for text in chunks if needle in text]
+    assert len(matches) == 1, f"expected {needle!r} in exactly one chunk, got {len(matches)}"
+    return matches[0]
 
 
 # ----------------------------------------------------------------------
@@ -62,6 +93,16 @@ def chunker() -> Chunker:
 def test_chunk_size_must_be_positive(bad_size: int) -> None:
     with pytest.raises(ValueError):
         Chunker(encoding_name=ENCODING, chunk_size=bad_size)
+
+
+@pytest.mark.parametrize("bad_extension", [-1, -12])
+def test_name_run_extension_must_not_be_negative(bad_extension: int) -> None:
+    with pytest.raises(ValueError):
+        Chunker(
+            encoding_name=ENCODING,
+            chunk_size=CHUNK_SIZE,
+            name_run_max_extension_tokens=bad_extension,
+        )
 
 
 # ----------------------------------------------------------------------
@@ -137,83 +178,169 @@ def test_chunk_count_scales_with_chunk_size() -> None:
     assert "".join(small) == "".join(large) == text
 
 
+
 # ----------------------------------------------------------------------
-# detection windows
+# name-aware cuts
 # ----------------------------------------------------------------------
 
+# The tentative cut falls between the two words of "Margaret Wetherby".
+NAME_STRADDLING_CUT = (
+    "Notes: the quarterly report was reviewed again and again by the auditors "
+    "before it was filed away our auditor Margaret Wetherby signed the amended "
+    "agreement without delay."
+)
 
-def test_window_of_middle_chunk_includes_neighbour_fragments(
-    chunker: Chunker,
+# The tentative cut falls inside "McKinsey", between "McKin" and "sey".
+WORD_STRADDLING_CUT = (
+    "Notes: the quarterly report was reviewed again and again by the auditors "
+    "before it was filed the consultants at McKinsey delivered the amended "
+    "agreement without delay."
+)
+
+# The tentative cut falls before the connector: "... the Bank | of America ...".
+CONNECTOR_RUN_CUT_BEFORE_CONNECTOR = (
+    "Notes: the quarterly report was reviewed again and again by the auditors "
+    "before it was filed away in the Bank of America underwrote the amended "
+    "agreement without any delay."
+)
+
+# The tentative cut falls after the connector: "... the Bank of | America ...".
+CONNECTOR_RUN_CUT_AFTER_CONNECTOR = (
+    "Notes: the quarterly report was reviewed again and again by the auditors "
+    "before it was filed away the Bank of America underwrote the amended "
+    "agreement without any delay."
+)
+
+# The tentative cut falls exactly on the sentence boundary after "Peter.".
+SENTENCE_BOUNDARY_CUT = (
+    "Notes: the quarterly report was reviewed again and again by the auditors "
+    "before the whole team finally met Peter. The auditors signed the amended "
+    "agreement."
+)
+
+# A Title Case run far longer than the extension budget can carry.
+TITLE_RUN_WORDS = [
+    "Grand", "Northern", "Valley", "Harbour", "Trust", "Mutual", "Holdings",
+    "Regional", "Advisory", "Council", "Annual", "General", "Meeting",
+    "Minutes", "Volume", "Seven", "Winter", "Session", "Special", "Edition",
+    "Appendix", "Charter", "Review", "Board", "Summary", "Preface", "Errata",
+    "Index", "Notice", "Ledger",
+]
+LONG_TITLE_RUN = (
+    "Notes: the auditors filed a document titled "
+    + " ".join(TITLE_RUN_WORDS)
+    + " and then everyone went home."
+)
+
+NAME_AWARE_SAMPLES = [
+    NAME_STRADDLING_CUT,
+    WORD_STRADDLING_CUT,
+    CONNECTOR_RUN_CUT_BEFORE_CONNECTOR,
+    CONNECTOR_RUN_CUT_AFTER_CONNECTOR,
+    SENTENCE_BOUNDARY_CUT,
+    LONG_TITLE_RUN,
+]
+
+
+@pytest.mark.parametrize("text", NAME_AWARE_SAMPLES, ids=range(len(NAME_AWARE_SAMPLES)))
+def test_name_aware_cuts_stay_lossless(chunker: Chunker, text: str) -> None:
+    """Moving a cut may never cost a byte."""
+    assert "".join(chunker.chunk(text)) == text
+
+
+def test_name_split_by_the_default_cut_ends_up_in_one_chunk(chunker: Chunker) -> None:
+    before, after = tentative_cut(NAME_STRADDLING_CUT)
+    assert before.endswith("Margaret") and after.startswith(" Wetherby")
+
+    chunks = chunker.chunk(NAME_STRADDLING_CUT)
+
+    assert "Margaret Wetherby" in chunk_containing(chunks, "Margaret")
+    assert "".join(chunks) == NAME_STRADDLING_CUT
+
+
+def test_cut_inside_a_capitalized_word_is_extended_past_it(chunker: Chunker) -> None:
+    before, after = tentative_cut(WORD_STRADDLING_CUT)
+    assert before.endswith("McKin") and after.startswith("sey")
+
+    chunks = chunker.chunk(WORD_STRADDLING_CUT)
+
+    assert "McKinsey" in chunk_containing(chunks, "McKin")
+    assert not any(text.endswith("McKin") for text in chunks)
+    assert "".join(chunks) == WORD_STRADDLING_CUT
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_before", "expected_after"),
+    [
+        (CONNECTOR_RUN_CUT_BEFORE_CONNECTOR, "Bank", " of"),
+        (CONNECTOR_RUN_CUT_AFTER_CONNECTOR, "Bank of", " America"),
+    ],
+    ids=["cut_before_connector", "cut_after_connector"],
+)
+def test_connector_run_is_never_cut(
+    chunker: Chunker, text: str, expected_before: str, expected_after: str
 ) -> None:
-    chunks = chunker.chunk(f"{ENGLISH_MARKDOWN}{CZECH_TEXT}{EMOJI_CJK_TEXT}")
-    assert len(chunks) >= 3
+    """"Bank of America" is one run: the connector may not become a seam."""
+    before, after = tentative_cut(text)
+    assert before.endswith(expected_before) and after.startswith(expected_after)
 
-    index = len(chunks) // 2
-    chunk_text = chunks[index]
-    window = chunker.window(chunks, index, MARGIN)
+    chunks = chunker.chunk(text)
 
-    assert chunk_text in window
-    assert window != chunk_text
-
-    prefix, _, suffix = window.partition(chunk_text)
-    assert prefix, "expected trailing context from the previous chunk"
-    assert suffix, "expected leading context from the next chunk"
-    assert chunks[index - 1].endswith(prefix)
-    assert chunks[index + 1].startswith(suffix)
+    assert "Bank of America" in chunk_containing(chunks, "Bank")
+    assert "".join(chunks) == text
 
 
-def test_window_of_first_chunk_has_no_left_margin(chunker: Chunker) -> None:
-    chunks = chunker.chunk(f"{ENGLISH_MARKDOWN}{CZECH_TEXT}")
-    window = chunker.window(chunks, 0, MARGIN)
+def test_sentence_boundary_cut_is_left_alone(chunker: Chunker) -> None:
+    """"...met Peter. The auditors..." is two runs, so the seam is legal."""
+    before, after = tentative_cut(SENTENCE_BOUNDARY_CUT)
+    assert before.endswith("Peter.") and after.startswith(" The")
 
-    assert window.startswith(chunks[0])
-    assert len(window) > len(chunks[0])
-    assert chunks[1].startswith(window[len(chunks[0]) :])
+    chunks = chunker.chunk(SENTENCE_BOUNDARY_CUT)
 
-
-def test_window_of_last_chunk_has_no_right_margin(chunker: Chunker) -> None:
-    chunks = chunker.chunk(f"{ENGLISH_MARKDOWN}{CZECH_TEXT}")
-    last = len(chunks) - 1
-    window = chunker.window(chunks, last, MARGIN)
-
-    assert window.endswith(chunks[last])
-    assert len(window) > len(chunks[last])
-    assert chunks[last - 1].endswith(window[: -len(chunks[last])])
+    # No extension happened: the first chunk is exactly the tentative cut.
+    assert chunks[0] == before
+    assert token_counts(chunks[:-1]) == [CHUNK_SIZE] * (len(chunks) - 1)
+    assert "".join(chunks) == SENTENCE_BOUNDARY_CUT
 
 
-def test_window_with_zero_margin_returns_chunk_unchanged(chunker: Chunker) -> None:
-    chunks = chunker.chunk(f"{ENGLISH_MARKDOWN}{CZECH_TEXT}")
-    for index, chunk_text in enumerate(chunks):
-        assert chunker.window(chunks, index, 0) == chunk_text
+def test_extension_stops_at_the_configured_cap(chunker: Chunker) -> None:
+    """A run longer than the budget is cut through rather than chased forever."""
+    chunks = chunker.chunk(LONG_TITLE_RUN)
+    counts = token_counts(chunks)
+
+    assert max(counts) <= CHUNK_SIZE + MAX_EXTENSION
+    # The budget really was spent: this run is long enough to exhaust it.
+    assert counts[0] == CHUNK_SIZE + MAX_EXTENSION
+    assert "".join(chunks) == LONG_TITLE_RUN
 
 
-def test_window_of_single_chunk_document_returns_chunk(chunker: Chunker) -> None:
-    chunks = chunker.chunk(SHORT_TEXT)
-    assert chunker.window(chunks, 0, MARGIN) == SHORT_TEXT
+def test_zero_extension_budget_keeps_the_plain_cut() -> None:
+    plain = Chunker(
+        encoding_name=ENCODING, chunk_size=CHUNK_SIZE, name_run_max_extension_tokens=0
+    )
+    before, _ = tentative_cut(NAME_STRADDLING_CUT)
+
+    chunks = plain.chunk(NAME_STRADDLING_CUT)
+
+    assert chunks[0] == before
+    assert "".join(chunks) == NAME_STRADDLING_CUT
 
 
-def test_window_keeps_unicode_intact_across_margins(chunker: Chunker) -> None:
-    """Margins may drop bytes at their outer edge but never emit broken text."""
-    chunks = chunker.chunk(EMOJI_CJK_TEXT + CZECH_TEXT)
-    for index in range(len(chunks)):
-        window = chunker.window(chunks, index, MARGIN)
-        # A str that round-trips through UTF-8 contains no lone surrogates or
-        # replacement damage introduced by the margin trimming.
-        assert window.encode("utf-8").decode("utf-8") == window
-        assert "�" not in window
-        assert chunks[index] in window
-
-
-@pytest.mark.parametrize("bad_index", [-1, 5, 99])
-def test_window_raises_index_error_for_out_of_range_index(
-    chunker: Chunker, bad_index: int
-) -> None:
-    chunks = chunker.chunk(SHORT_TEXT)
-    assert len(chunks) == 1
-    with pytest.raises(IndexError):
-        chunker.window(chunks, bad_index, MARGIN)
-
-
-def test_window_on_empty_chunk_list_raises_index_error(chunker: Chunker) -> None:
-    with pytest.raises(IndexError):
-        chunker.window([], 0, MARGIN)
+@pytest.mark.parametrize(
+    "text",
+    NAME_AWARE_SAMPLES + [ENGLISH_MARKDOWN, CZECH_TEXT, EMOJI_CJK_TEXT],
+    ids=range(len(NAME_AWARE_SAMPLES) + 3),
+)
+def test_chunking_is_deterministic(text: str) -> None:
+    """Same input, same cuts - the adjustment introduces no state."""
+    first = Chunker(
+        encoding_name=ENCODING,
+        chunk_size=CHUNK_SIZE,
+        name_run_max_extension_tokens=MAX_EXTENSION,
+    ).chunk(text)
+    second = Chunker(
+        encoding_name=ENCODING,
+        chunk_size=CHUNK_SIZE,
+        name_run_max_extension_tokens=MAX_EXTENSION,
+    ).chunk(text)
+    assert first == second == Chunker(ENCODING, CHUNK_SIZE, MAX_EXTENSION).chunk(text)

@@ -34,7 +34,6 @@ from doc_quant.detector import (
 MODEL = "claude-opus-5"
 EFFORT = "low"
 MAX_TOKENS = 1024
-MARGIN_TOKENS = 8
 
 HONEYTOKEN_RATE = 0.02
 CHAFF_RATIO = 1.0
@@ -55,7 +54,7 @@ def make_config(
         chunking=SimpleNamespace(
             chunk_size_tokens=22,
             encoding="cl100k_base",
-            detection_margin_tokens=MARGIN_TOKENS,
+            name_run_max_extension_tokens=12,
         ),
         anthropic=SimpleNamespace(model=MODEL, effort=EFFORT, max_tokens=MAX_TOKENS),
         synthetic=SimpleNamespace(
@@ -219,10 +218,14 @@ class FakeStore:
 
 
 class FakeChunker:
-    """Window builder that makes the applied margin visible in the output."""
+    """Chunker stand-in that fails loudly if submission asks it for anything.
 
-    def window(self, chunk_texts: list[str], index: int, margin_tokens: int) -> str:
-        return f"<-{margin_tokens}-{chunk_texts[index]}-{margin_tokens}->"
+    Real requests carry the stored chunk text verbatim, so there is nothing
+    left for the chunker to contribute at submission time.
+    """
+
+    def __getattr__(self, name: str):
+        raise AssertionError(f"Detector must not call chunker.{name} during submission")
 
 
 class FakeBatches:
@@ -411,6 +414,10 @@ def test_submit_sends_the_synthetic_fragment_text_verbatim():
     for canary_id in canary_ids:
         index = canary_id.split("-")[1]
         assert contents[canary_id] == f"Petr Kanar {index} spent a winter in Zbrusnovice."
+
+    # A real chunk is sent the same way: its stored text, nothing added.
+    for chunk in chunks:
+        assert contents[chunk["chunk_id"]] == chunk["text"]
 
 
 def test_submit_with_synthetic_disabled_sends_real_chunks_only():
