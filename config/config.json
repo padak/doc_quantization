@@ -1,0 +1,19 @@
+{
+  "chunking": {
+    "chunk_size_tokens": 22,
+    "encoding": "cl100k_base",
+    "detection_margin_tokens": 8
+  },
+  "database": {
+    "path": "data/chunks.db"
+  },
+  "anthropic": {
+    "model": "claude-opus-5",
+    "effort": "low",
+    "max_tokens": 1024
+  },
+  "redaction": {
+    "person": "**PERSON**",
+    "company": "**COMPANY**"
+  }
+}
