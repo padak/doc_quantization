@@ -155,9 +155,9 @@ if it ignored every contract and kept everything we ever sent?".
 
 Even then, it holds:
 
-- **Fragments, not documents.** Isolated snippets of at most
-  `chunk_size + 2 * margin` tokens of contiguous text (38 with the defaults),
-  stripped of filenames, titles, authorship and any document identity.
+- **Fragments, not documents.** Isolated snippets of roughly `chunk_size`
+  tokens of contiguous text (~22 with the defaults), stripped of filenames,
+  titles, authorship and any document identity.
 - **A shuffled pool under meaningless IDs.** Chunk ordering lives only in the
   local database and is never transmitted; the random UUIDs encode nothing.
 - **A corpus that is half fake.** Chaff is mixed 1:1 and is indistinguishable
@@ -178,18 +178,20 @@ Even then, it holds:
   known entities are pre-redacted before anything leaves the machine).
 - **Co-membership.** All fragments arrive from one account, so "these belong
   to the same client" is observable; what they form is not.
-- **Margin seams.** Neighboring detection windows currently share a few
-  identical overlap tokens, so a determined adversary can partially chain
-  adjacent fragments. Treat partial reassembly as feasible until the planned
-  overlap-free candidate spans land.
+- **Reassembly is a statistical fight, not a lookup.** Outbound fragments are
+  mutually disjoint — chunk cuts are name-aware, so no overlap seams exist to
+  chain them. What remains for an adversary is linguistic stitching of
+  22-token crumbs across a shuffled, half-fake pool. Residual risk: names
+  that defy capitalization conventions, or capitalized runs longer than the
+  extension cap, can still straddle a cut.
 - **This is not GDPR anonymization.** Fragments containing real names remain
   personal data. The pipeline delivers data minimization and unlinkability on
   top of your DPA — it complements the contract, it does not replace it.
 
 In one sentence: even in the scenario your lawyers fear most, the adversary
-ends up with a shuffled, half-fabricated pile of 38-token crumbs, no way to
-tell real from fake, and fifty landmines that convert cheating into
-evidence.
+ends up with a shuffled, half-fabricated pile of disjoint 22-token crumbs,
+no way to tell real from fake, and fifty landmines that convert cheating
+into evidence.
 
 ## Known limitations
 
