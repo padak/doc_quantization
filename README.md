@@ -70,8 +70,21 @@ hallucination can never poison the registry or the tripwire.
 
 ## Installation
 
+Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
+
 ```bash
-python -m venv .venv
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pytest -q          # 234 tests should pass
+```
+
+On macOS, `python3` may point at the system interpreter shipped with Xcode,
+which comes with a very old pip. If installation fails with
+`Could not find a version that satisfies the requirement ...`, upgrade pip
+inside the virtual environment and retry:
+
+```bash
+.venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 ```
 
