@@ -48,17 +48,69 @@ class RedactionConfig:
 
 
 @dataclass(frozen=True)
+class SyntheticLLMConfig:
+    """Local OpenAI-compatible endpoint used to phrase synthetic fragments.
+
+    Any server speaking the OpenAI chat-completions protocol works: Ollama,
+    LM Studio or llama.cpp's server. Nothing sensitive is sent there, but the
+    endpoint is expected to stay on the machine running this tool.
+    """
+
+    base_url: str
+    model: str
+    temperature: float
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class SyntheticConfig:
+    """Canaries-and-chaff settings.
+
+    honeytoken_rate, chaff_ratio and canaries_per_batch describe how many
+    synthetic fragments ride along with a batch of real chunks; the three
+    *_enabled flags switch the individual mechanisms off without removing the
+    already generated fragments from the store.
+    """
+
+    honeytokens_enabled: bool
+    chaff_enabled: bool
+    canaries_enabled: bool
+    chaff_ratio: float
+    honeytoken_rate: float
+    canary_set_size: int
+    canaries_per_batch: int
+    seed: int
+    llm: SyntheticLLMConfig
+
+
+@dataclass(frozen=True)
 class AppConfig:
     chunking: ChunkingConfig
     database: DatabaseConfig
     anthropic: AnthropicConfig
     redaction: RedactionConfig
+    synthetic: SyntheticConfig
 
 
 def _require(section: dict, key: str, section_name: str):
     if key not in section:
         raise ConfigError(f"Missing required config key: {section_name}.{key}")
     return section[key]
+
+
+def _require_bool(section: dict, key: str, section_name: str) -> bool:
+    """Fetch a key that must be a real JSON boolean.
+
+    Plain `bool()` would silently turn the string "false" into True, which is
+    exactly the kind of quiet misreading these switches must not suffer from.
+    """
+    value = _require(section, key, section_name)
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f"Config key {section_name}.{key} must be a boolean, "
+            f"got {type(value).__name__}"
+        )
+    return value
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -68,7 +120,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     with open(config_path, encoding="utf-8") as f:
         raw = json.load(f)
 
-    for section in ("chunking", "database", "anthropic", "redaction"):
+    for section in ("chunking", "database", "anthropic", "redaction", "synthetic"):
         if section not in raw:
             raise ConfigError(f"Missing required config section: {section}")
 
@@ -92,11 +144,39 @@ def load_config(path: Path | None = None) -> AppConfig:
         person=_require(raw["redaction"], "person", "redaction"),
         company=_require(raw["redaction"], "company", "redaction"),
     )
+    synthetic = _load_synthetic(raw["synthetic"])
     return AppConfig(
         chunking=chunking,
         database=database,
         anthropic=anthropic_cfg,
         redaction=redaction,
+        synthetic=synthetic,
+    )
+
+
+def _load_synthetic(raw: dict) -> SyntheticConfig:
+    """Build the synthetic section, failing fast on any missing key."""
+    raw_llm = _require(raw, "llm", "synthetic")
+    if not isinstance(raw_llm, dict):
+        raise ConfigError(
+            f"Config key synthetic.llm must be an object, got {type(raw_llm).__name__}"
+        )
+    llm = SyntheticLLMConfig(
+        base_url=_require(raw_llm, "base_url", "synthetic.llm"),
+        model=_require(raw_llm, "model", "synthetic.llm"),
+        temperature=float(_require(raw_llm, "temperature", "synthetic.llm")),
+        timeout_seconds=float(_require(raw_llm, "timeout_seconds", "synthetic.llm")),
+    )
+    return SyntheticConfig(
+        honeytokens_enabled=_require_bool(raw, "honeytokens_enabled", "synthetic"),
+        chaff_enabled=_require_bool(raw, "chaff_enabled", "synthetic"),
+        canaries_enabled=_require_bool(raw, "canaries_enabled", "synthetic"),
+        chaff_ratio=float(_require(raw, "chaff_ratio", "synthetic")),
+        honeytoken_rate=float(_require(raw, "honeytoken_rate", "synthetic")),
+        canary_set_size=int(_require(raw, "canary_set_size", "synthetic")),
+        canaries_per_batch=int(_require(raw, "canaries_per_batch", "synthetic")),
+        seed=int(_require(raw, "seed", "synthetic")),
+        llm=llm,
     )
 
 

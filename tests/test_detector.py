@@ -6,18 +6,10 @@ Everything is exercised against in-memory stand-ins: no network, no API key.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from doc_quant.config import (
-    AnthropicConfig,
-    AppConfig,
-    ChunkingConfig,
-    DatabaseConfig,
-    RedactionConfig,
-)
 from doc_quant.detector import DETECTION_SYSTEM_PROMPT, ENTITY_SCHEMA, Detector
 
 MODEL = "claude-opus-5"
@@ -26,16 +18,28 @@ MAX_TOKENS = 1024
 MARGIN_TOKENS = 8
 
 
-def make_config() -> AppConfig:
-    return AppConfig(
-        chunking=ChunkingConfig(
+def make_config() -> SimpleNamespace:
+    """Config stand-in with every synthetic feature off.
+
+    These tests cover the real-chunk path only; the synthetic fragments have
+    their own file (test_detector_synthetic.py).
+    """
+    return SimpleNamespace(
+        chunking=SimpleNamespace(
             chunk_size_tokens=22,
             encoding="cl100k_base",
             detection_margin_tokens=MARGIN_TOKENS,
         ),
-        database=DatabaseConfig(path=Path("unused.db")),
-        anthropic=AnthropicConfig(model=MODEL, effort=EFFORT, max_tokens=MAX_TOKENS),
-        redaction=RedactionConfig(person="**PERSON**", company="**COMPANY**"),
+        anthropic=SimpleNamespace(model=MODEL, effort=EFFORT, max_tokens=MAX_TOKENS),
+        synthetic=SimpleNamespace(
+            honeytokens_enabled=False,
+            chaff_enabled=False,
+            canaries_enabled=False,
+            chaff_ratio=1.0,
+            honeytoken_rate=0.02,
+            canary_set_size=5,
+            canaries_per_batch=5,
+        ),
     )
 
 
@@ -73,6 +77,10 @@ class FakeStore:
 
     def add_entities(self, chunk_id: str, entities: list[tuple[str, str]]) -> None:
         self.entities.setdefault(chunk_id, []).extend(entities)
+
+    def get_synthetic_fragment(self, fragment_id: str) -> dict | None:
+        # No synthetic fragments are generated in this file, so every id is real.
+        return None
 
 
 class FakeChunker:
@@ -127,6 +135,20 @@ def failed_result(custom_id: str, result_type: str) -> SimpleNamespace:
 
 def entity_payload(*entities: tuple[str, str]) -> str:
     return json.dumps({"entities": [{"text": t, "type": k} for t, k in entities]})
+
+
+def expected_counts(
+    succeeded: int = 0, errored: int = 0, refused: int = 0, entities: int = 0
+) -> dict:
+    """Full fetch counts; the synthetic keys stay zero throughout this file."""
+    return {
+        "succeeded": succeeded,
+        "errored": errored,
+        "refused": refused,
+        "entities": entities,
+        "honeytokens_scored": 0,
+        "synthetic_discarded": 0,
+    }
 
 
 @pytest.fixture
@@ -253,7 +275,7 @@ def test_fetch_stores_entities_from_succeeded_result():
 
     counts = make_detector(store, client).fetch("msgbatch_test")
 
-    assert counts == {"succeeded": 1, "errored": 0, "refused": 0, "entities": 2}
+    assert counts == expected_counts(succeeded=1, entities=2)
     assert store.entities == {"chunk-a": [("Jan Novak", "person"), ("Keboola", "company")]}
     assert store.status_updates == [("msgbatch_test", "fetched")]
 
@@ -265,7 +287,7 @@ def test_fetch_handles_empty_entity_list():
 
     counts = make_detector(store, client).fetch("msgbatch_test")
 
-    assert counts == {"succeeded": 1, "errored": 0, "refused": 0, "entities": 0}
+    assert counts == expected_counts(succeeded=1)
     assert store.entities == {"chunk-a": []}
 
 
@@ -278,7 +300,7 @@ def test_fetch_counts_refusal_without_parsing():
 
     counts = make_detector(store, client).fetch("msgbatch_test")
 
-    assert counts == {"succeeded": 0, "errored": 0, "refused": 1, "entities": 0}
+    assert counts == expected_counts(refused=1)
     assert store.entities == {}
 
 
@@ -289,7 +311,7 @@ def test_fetch_counts_malformed_json_as_errored():
 
     counts = make_detector(store, client).fetch("msgbatch_test")
 
-    assert counts == {"succeeded": 0, "errored": 1, "refused": 0, "entities": 0}
+    assert counts == expected_counts(errored=1)
     assert store.entities == {}
 
 
@@ -324,7 +346,7 @@ def test_fetch_counts_failed_results_as_errored(result_type):
 
     counts = make_detector(store, client).fetch("msgbatch_test")
 
-    assert counts == {"succeeded": 0, "errored": 1, "refused": 0, "entities": 0}
+    assert counts == expected_counts(errored=1)
     assert store.entities == {}
 
 
@@ -340,6 +362,6 @@ def test_fetch_mixed_results_are_counted_independently():
 
     counts = make_detector(store, client).fetch("msgbatch_test")
 
-    assert counts == {"succeeded": 1, "errored": 2, "refused": 1, "entities": 1}
+    assert counts == expected_counts(succeeded=1, errored=2, refused=1, entities=1)
     assert store.entities == {"chunk-a": [("Jan", "person")]}
     assert client.batches.results_calls == ["msgbatch_test"]

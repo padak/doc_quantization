@@ -5,10 +5,18 @@ id must not leak which document it belongs to nor where it sits inside that
 document, because chunk ids travel out of context together with the chunk text.
 The ordering information lives exclusively in the local `chunks.seq` column,
 which never leaves this database.
+
+The store is also the ledger for the synthetic fragments (honeytokens, chaff
+and canaries) that ride along with outbound batches: `synthetic_fragments`
+records what was planted in each of them, `honeytoken_results` records what
+the provider reported back, and `canary_probes` records later tripwire checks.
+The tables are created with CREATE TABLE IF NOT EXISTS alongside the original
+ones, so a database written before this extension upgrades on first open.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import uuid
@@ -46,17 +54,73 @@ CREATE TABLE IF NOT EXISTS entities (
     type     TEXT NOT NULL CHECK(type IN ('person','company'))
 );
 
+CREATE TABLE IF NOT EXISTS synthetic_fragments (
+    fragment_id TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK(kind IN ('honeytoken','chaff','canary')),
+    text        TEXT NOT NULL,
+    planted     TEXT NOT NULL,
+    fact        TEXT,
+    batch_id    TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS honeytoken_results (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fragment_id TEXT NOT NULL REFERENCES synthetic_fragments(fragment_id),
+    batch_id    TEXT NOT NULL,
+    found       TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS canary_probes (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    fragment_id      TEXT NOT NULL REFERENCES synthetic_fragments(fragment_id),
+    model            TEXT NOT NULL,
+    tripped          INTEGER NOT NULL,
+    response_excerpt TEXT NOT NULL,
+    probed_at        TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_chunks_doc_seq ON chunks(doc_id, seq);
 CREATE INDEX IF NOT EXISTS idx_chunks_batch ON chunks(batch_id);
 CREATE INDEX IF NOT EXISTS idx_entities_chunk ON entities(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_synthetic_kind ON synthetic_fragments(kind);
+CREATE INDEX IF NOT EXISTS idx_synthetic_batch ON synthetic_fragments(batch_id);
+CREATE INDEX IF NOT EXISTS idx_honeytoken_results_batch
+    ON honeytoken_results(batch_id);
+CREATE INDEX IF NOT EXISTS idx_canary_probes_fragment ON canary_probes(fragment_id);
 """
 
 _CHUNK_COLUMNS = "chunk_id, doc_id, seq, text, batch_id"
+_SYNTHETIC_COLUMNS = "fragment_id, kind, text, planted, fact, batch_id, created_at"
 
 
 def _utc_now() -> str:
     """Return the current UTC timestamp as an ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _dump_pairs(pairs: list[tuple[str, str]]) -> str:
+    """Serialize (name, type) pairs as a JSON list of two-element lists.
+
+    Non-ASCII is kept verbatim so the stored column stays readable for names
+    that the provider may report back with diacritics.
+    """
+    return json.dumps(
+        [[name, entity_type] for name, entity_type in pairs], ensure_ascii=False
+    )
+
+
+def _load_pairs(payload: str) -> list[tuple[str, str]]:
+    """Read back a column written by `_dump_pairs`."""
+    return [(name, entity_type) for name, entity_type in json.loads(payload)]
+
+
+def _synthetic_row_to_dict(row: sqlite3.Row) -> dict:
+    """Turn a synthetic_fragments row into a dict with decoded `planted`."""
+    fragment = dict(row)
+    fragment["planted"] = _load_pairs(fragment["planted"])
+    return fragment
 
 
 class ChunkStore:
@@ -299,8 +363,232 @@ class ChunkStore:
         return [(row["text"], row["type"]) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------
+    # synthetic fragments
+    # ------------------------------------------------------------------
+
+    def add_synthetic_fragments(self, fragments: list[dict]) -> None:
+        """Register synthetic fragments before they may be submitted anywhere.
+
+        Args:
+            fragments: dicts with the keys `fragment_id`, `kind`, `text`,
+                `planted` (a list of (name, type) pairs planted verbatim in the
+                text) and `fact` (the unique canary fact, None for other kinds).
+
+        Raises:
+            KeyError: if a dict is missing one of the required keys.
+            sqlite3.IntegrityError: on a duplicate id or an unknown kind.
+        """
+        if not fragments:
+            logger.debug("add_synthetic_fragments called with no fragments")
+            return
+
+        created_at = _utc_now()
+        rows = [
+            (
+                fragment["fragment_id"],
+                fragment["kind"],
+                fragment["text"],
+                _dump_pairs(fragment["planted"]),
+                fragment.get("fact"),
+                created_at,
+            )
+            for fragment in fragments
+        ]
+        with self._connection:
+            self._connection.executemany(
+                "INSERT INTO synthetic_fragments "
+                "(fragment_id, kind, text, planted, fact, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        logger.info("Registered %d synthetic fragments", len(rows))
+
+    def get_synthetic_fragment(self, fragment_id: str) -> dict | None:
+        """Return one synthetic fragment, or None when the id is not synthetic.
+
+        Callers use the None result to tell a synthetic fragment id apart from
+        a real chunk id when a batch result comes back, so an unknown id is a
+        normal answer here rather than an error.
+        """
+        cursor = self._connection.execute(
+            f"SELECT {_SYNTHETIC_COLUMNS} FROM synthetic_fragments "
+            "WHERE fragment_id = ?",
+            (fragment_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return _synthetic_row_to_dict(row)
+
+    def list_synthetic_fragments(self, kind: str | None = None) -> list[dict]:
+        """Return all synthetic fragments, optionally restricted to one kind."""
+        if kind is None:
+            cursor = self._connection.execute(
+                f"SELECT {_SYNTHETIC_COLUMNS} FROM synthetic_fragments "
+                "ORDER BY created_at, fragment_id"
+            )
+        else:
+            cursor = self._connection.execute(
+                f"SELECT {_SYNTHETIC_COLUMNS} FROM synthetic_fragments "
+                "WHERE kind = ? ORDER BY created_at, fragment_id",
+                (kind,),
+            )
+        return [_synthetic_row_to_dict(row) for row in cursor.fetchall()]
+
+    def mark_synthetic_submitted(self, fragment_ids: list[str], batch_id: str) -> None:
+        """Attach `batch_id` to the given synthetic fragments."""
+        if not fragment_ids:
+            logger.debug("mark_synthetic_submitted called with no fragment ids")
+            return
+        with self._connection:
+            cursor = self._connection.executemany(
+                "UPDATE synthetic_fragments SET batch_id = ? WHERE fragment_id = ?",
+                [(batch_id, fragment_id) for fragment_id in fragment_ids],
+            )
+        if cursor.rowcount != len(fragment_ids):
+            logger.warning(
+                "Marked %d of %d synthetic fragments as submitted to batch %s; "
+                "some fragment ids were unknown",
+                cursor.rowcount,
+                len(fragment_ids),
+                batch_id,
+            )
+
+    # ------------------------------------------------------------------
+    # honeytoken results
+    # ------------------------------------------------------------------
+
+    def record_honeytoken_result(
+        self, fragment_id: str, batch_id: str, found: list[tuple[str, str]]
+    ) -> None:
+        """Record which planted names the provider reported for a honeytoken.
+
+        Args:
+            fragment_id: the synthetic fragment that was scored.
+            batch_id: the batch the fragment travelled in.
+            found: the (name, type) pairs the provider returned for it.
+
+        Raises:
+            KeyError: if `fragment_id` is not a known synthetic fragment.
+        """
+        self._require_synthetic_fragment(fragment_id)
+        with self._connection:
+            self._connection.execute(
+                "INSERT INTO honeytoken_results "
+                "(fragment_id, batch_id, found, created_at) VALUES (?, ?, ?, ?)",
+                (fragment_id, batch_id, _dump_pairs(found), _utc_now()),
+            )
+        logger.debug(
+            "Recorded %d found names for honeytoken %s in batch %s",
+            len(found),
+            fragment_id,
+            batch_id,
+        )
+
+    def honeytoken_stats(self) -> list[dict]:
+        """Aggregate recall per batch over all recorded honeytoken results.
+
+        A planted (name, type) pair counts as found when the same name text
+        comes back, no matter which type the provider assigned to it: the
+        measurement is about the name being spotted at all, and a person or
+        company mix-up still means the name would have been redacted.
+
+        Returns:
+            One dict per batch with the keys `batch_id`, `honeytokens_scored`,
+            `planted_total`, `found_total` and `recall`, ordered by batch id.
+            `recall` is 0.0 for the degenerate case of nothing planted.
+        """
+        cursor = self._connection.execute(
+            """
+            SELECT r.batch_id AS batch_id,
+                   r.found AS found,
+                   f.planted AS planted
+            FROM honeytoken_results r
+            JOIN synthetic_fragments f ON f.fragment_id = r.fragment_id
+            ORDER BY r.batch_id, r.id
+            """
+        )
+
+        stats: dict[str, dict] = {}
+        for row in cursor.fetchall():
+            entry = stats.setdefault(
+                row["batch_id"],
+                {
+                    "batch_id": row["batch_id"],
+                    "honeytokens_scored": 0,
+                    "planted_total": 0,
+                    "found_total": 0,
+                },
+            )
+            planted = _load_pairs(row["planted"])
+            found_names = {name for name, _ in _load_pairs(row["found"])}
+            entry["honeytokens_scored"] += 1
+            entry["planted_total"] += len(planted)
+            entry["found_total"] += sum(
+                1 for name, _ in planted if name in found_names
+            )
+
+        for entry in stats.values():
+            planted_total = entry["planted_total"]
+            entry["recall"] = (
+                entry["found_total"] / planted_total if planted_total else 0.0
+            )
+        return [stats[batch_id] for batch_id in sorted(stats)]
+
+    # ------------------------------------------------------------------
+    # canary probes
+    # ------------------------------------------------------------------
+
+    def record_canary_probe(
+        self, fragment_id: str, model: str, tripped: bool, response_excerpt: str
+    ) -> None:
+        """Record the outcome of probing a model for a planted canary fact.
+
+        Raises:
+            KeyError: if `fragment_id` is not a known synthetic fragment.
+        """
+        self._require_synthetic_fragment(fragment_id)
+        with self._connection:
+            self._connection.execute(
+                "INSERT INTO canary_probes "
+                "(fragment_id, model, tripped, response_excerpt, probed_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (fragment_id, model, int(tripped), response_excerpt, _utc_now()),
+            )
+        if tripped:
+            logger.warning(
+                "Canary %s tripped on model %s: the planted fact came back",
+                fragment_id,
+                model,
+            )
+        else:
+            logger.debug("Canary %s did not trip on model %s", fragment_id, model)
+
+    def list_canary_probes(self) -> list[dict]:
+        """Return all canary probes, oldest first, with `tripped` as a bool."""
+        cursor = self._connection.execute(
+            "SELECT id, fragment_id, model, tripped, response_excerpt, probed_at "
+            "FROM canary_probes ORDER BY probed_at, id"
+        )
+        probes = []
+        for row in cursor.fetchall():
+            probe = dict(row)
+            probe["tripped"] = bool(probe["tripped"])
+            probes.append(probe)
+        return probes
+
+    # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+
+    def _require_synthetic_fragment(self, fragment_id: str) -> None:
+        """Raise KeyError when the synthetic fragment does not exist."""
+        cursor = self._connection.execute(
+            "SELECT 1 FROM synthetic_fragments WHERE fragment_id = ? LIMIT 1",
+            (fragment_id,),
+        )
+        if cursor.fetchone() is None:
+            raise KeyError(f"Unknown synthetic fragment_id: {fragment_id}")
 
     def _require_document(self, doc_id: str) -> None:
         """Raise KeyError when the document does not exist."""

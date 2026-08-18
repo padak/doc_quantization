@@ -15,5 +15,21 @@
   "redaction": {
     "person": "**PERSON**",
     "company": "**COMPANY**"
+  },
+  "synthetic": {
+    "honeytokens_enabled": true,
+    "chaff_enabled": true,
+    "canaries_enabled": true,
+    "chaff_ratio": 1.0,
+    "honeytoken_rate": 0.02,
+    "canary_set_size": 50,
+    "canaries_per_batch": 5,
+    "seed": 20260818,
+    "llm": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "qwen2.5:7b",
+      "temperature": 0.8,
+      "timeout_seconds": 120
+    }
   }
 }
