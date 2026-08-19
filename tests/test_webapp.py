@@ -762,6 +762,67 @@ def test_upload_of_an_empty_document_is_rejected(harness):
 
 
 # ---------------------------------------------------------------------------
+# pasted text
+# ---------------------------------------------------------------------------
+
+
+def test_pasted_text_is_stored_verbatim_with_lossless_chunks(harness):
+    response = harness.client.post("/api/documents/text", json={"text": SAMPLE_MARKDOWN})
+
+    assert response.status_code == 200, response.text
+    document = response.json()
+    assert document["filename"] == server.FALLBACK_PASTED_NAME
+    # Pasted text takes the verbatim path: no conversion, byte-for-byte storage.
+    assert document["markdown"] == SAMPLE_MARKDOWN
+    assert harness.http.posted == []
+    assert "".join(chunk["text"] for chunk in document["chunks"]) == SAMPLE_MARKDOWN
+
+    listing = harness.client.get("/api/documents").json()
+    assert len(listing) == 1
+    assert listing[0]["doc_id"] == document["doc_id"]
+    assert listing[0]["path"] == server.FALLBACK_PASTED_NAME
+
+
+def test_pasted_text_honours_a_custom_name(harness):
+    response = harness.client.post(
+        "/api/documents/text",
+        json={"text": SAMPLE_MARKDOWN, "name": "  board-memo.md  "},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == "board-memo.md"
+
+
+def test_pasted_text_with_a_blank_name_falls_back_to_the_default(harness):
+    response = harness.client.post(
+        "/api/documents/text", json={"text": SAMPLE_MARKDOWN, "name": "   "}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["filename"] == server.FALLBACK_PASTED_NAME
+
+
+def test_pasted_blank_text_is_rejected(harness):
+    response = harness.client.post("/api/documents/text", json={"text": "   \n\t"})
+
+    assert response.status_code == 422
+    assert "empty" in response.json()["detail"]
+
+
+def test_pasted_multibyte_text_survives_chunk_display(harness):
+    response = harness.client.post(
+        "/api/documents/text", json={"text": MULTIBYTE_MARKDOWN}
+    )
+
+    assert response.status_code == 200, response.text
+    document = response.json()
+    for chunk in document["chunks"]:
+        assert "".join(chunk["tokens"]) == chunk["text"]
+        assert "�" not in "".join(chunk["tokens"])
+    assert "".join(chunk["text"] for chunk in document["chunks"]) == MULTIBYTE_MARKDOWN
+
+
+# ---------------------------------------------------------------------------
 # documents
 # ---------------------------------------------------------------------------
 

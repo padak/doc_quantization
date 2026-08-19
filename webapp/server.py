@@ -109,6 +109,9 @@ CONVERT_MARKDOWN_FIELD = "markdown"
 # Converting a large PDF well takes time; this is not the preflight's timeout.
 CONVERT_TIMEOUT_SECONDS = 120.0
 FALLBACK_UPLOAD_NAME = "upload"
+# Pasted text arrives with no filename at all; the suffix keeps the document
+# on the raw-text path everywhere a name is inspected.
+FALLBACK_PASTED_NAME = "pasted-text.md"
 
 # A synchronous run is still recorded as a batch so that honeytoken results and
 # chunk submission state share one ledger with the CLI's batch runs. The prefix
@@ -310,6 +313,13 @@ class SettingsUpdate(BaseModel):
     conversion_service_url: str | None = None
 
 
+class TextDocumentRequest(BaseModel):
+    """Text pasted straight into the UI, plus an optional display name."""
+
+    text: str
+    name: str | None = None
+
+
 class DetectRequest(BaseModel):
     doc_id: str
 
@@ -433,7 +443,33 @@ def upload_document(
             status_code=HTTP_UNPROCESSABLE,
             detail=f"Conversion of {filename} produced no text",
         )
+    return _store_markdown(filename, markdown, context, store)
 
+
+@app.post("/api/documents/text")
+def ingest_text_document(
+    request: TextDocumentRequest,
+    context: RequestContext = Depends(context_dependency),
+    store: ChunkStore = Depends(store_dependency),
+) -> dict:
+    """Chunk and store text pasted directly into the UI.
+
+    The text is already what the pipeline wants, so it takes the same verbatim
+    path as an uploaded ``.md``/``.txt`` file - no conversion service involved.
+    """
+    if not request.text.strip():
+        raise HTTPException(
+            status_code=HTTP_UNPROCESSABLE,
+            detail="Pasted text is empty",
+        )
+    name = (request.name or "").strip() or FALLBACK_PASTED_NAME
+    return _store_markdown(name, request.text, context, store)
+
+
+def _store_markdown(
+    filename: str, markdown: str, context: RequestContext, store: ChunkStore
+) -> dict:
+    """Chunk `markdown`, store it under `filename` and build the API payload."""
     chunker = get_chunker(context.config)
     chunk_texts = chunker.chunk(markdown)
     doc_id = store.add_document(filename, chunk_texts)

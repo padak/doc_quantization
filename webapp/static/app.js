@@ -141,6 +141,8 @@
     verifyError: null,       // why the check itself could not run
     verifyAuto: false,
     batchView: 'local',      // 'local' | 'provider'
+    pasteText: '',           // survives re-renders of the paste-text card
+    pasteName: '',
     introDismissed: false,
     hint: null,              // { view, text } — why the user was sent here
     busy: {
@@ -683,6 +685,20 @@
     html += '</div>';
     html += '<input type="file" id="file-input" style="display:none">';
 
+    html += '<div class="paste-card card">';
+    html += '<h3 class="paste-title">Or paste text directly</h3>';
+    html += '<div class="paste-hint">Anything you can copy — an email, a contract clause, meeting notes — is ingested as-is, no file needed.</div>';
+    html += '<textarea id="paste-text" class="paste-textarea" rows="7" ' +
+      'placeholder="Paste or type the text here" spellcheck="false"' +
+      (busy ? ' disabled' : '') + '></textarea>';
+    html += '<div class="paste-actions">';
+    html += '<input type="text" id="paste-name" class="paste-name" ' +
+      'placeholder="Name (optional, e.g. board-memo.md)"' + (busy ? ' disabled' : '') + '>';
+    html += '<button type="button" class="btn btn-primary" id="paste-ingest"' +
+      (busy ? ' disabled' : '') + '>Ingest text</button>';
+    html += '</div>';
+    html += '</div>';
+
     if (store.doc) {
       const chunkCount = safeArray(store.doc.chunks).length;
       html += '<h3 class="section-title">Active document</h3>';
@@ -772,6 +788,24 @@
       });
     }
 
+    const pasteText = root.querySelector('#paste-text');
+    const pasteName = root.querySelector('#paste-name');
+    const pasteButton = root.querySelector('#paste-ingest');
+    if (pasteText && pasteName && pasteButton) {
+      // innerHTML re-renders wipe form state, so the fields live in the store.
+      pasteText.value = store.pasteText;
+      pasteName.value = store.pasteName;
+      const sync = () => {
+        store.pasteText = pasteText.value;
+        store.pasteName = pasteName.value;
+        pasteButton.disabled = store.busy.upload || !pasteText.value.trim();
+      };
+      sync();
+      pasteText.addEventListener('input', sync);
+      pasteName.addEventListener('input', sync);
+      pasteButton.addEventListener('click', () => ingestPastedText());
+    }
+
     root.querySelectorAll('[data-doc]').forEach((button) => {
       button.addEventListener('click', () => openDocument(button.getAttribute('data-doc')));
     });
@@ -803,6 +837,37 @@
       const payload = await api('/api/documents', { method: 'POST', body: form });
       adoptDocument(payload, file.name);
       toast('ok', 'Ingested "' + (store.doc ? store.doc.name : file.name) + '" — ' +
+        (store.doc ? safeArray(store.doc.chunks).length : 0) + ' chunks');
+      try {
+        await loadDocs();
+      } catch (err) {
+        /* the document list is secondary */
+      }
+      prefetchRedaction();
+    } catch (err) {
+      fail('document', err);
+    } finally {
+      store.busy.upload = false;
+      render();
+    }
+  }
+
+  async function ingestPastedText() {
+    const text = store.pasteText;
+    if (!text.trim() || store.busy.upload) return;
+    clearAlert('document');
+    store.busy.upload = true;
+    render();
+
+    try {
+      const payload = await apiJson('/api/documents/text', 'POST', {
+        text: text,
+        name: store.pasteName.trim() || null,
+      });
+      adoptDocument(payload);
+      store.pasteText = '';
+      store.pasteName = '';
+      toast('ok', 'Ingested "' + (store.doc ? store.doc.name : 'pasted text') + '" — ' +
         (store.doc ? safeArray(store.doc.chunks).length : 0) + ' chunks');
       try {
         await loadDocs();

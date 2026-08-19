@@ -48,8 +48,9 @@ deterministically by regex before the entity pass — they never need the LLM.
 .venv/bin/uvicorn webapp.server:app --port 8801
 ```
 
-Every pipeline step is observable in a local web console: upload and
-conversion, token-level chunk view, batch composition, exact LLM payloads and
+Every pipeline step is observable in a local web console: upload (file,
+drag-and-drop, or text pasted straight into the page) and conversion,
+token-level chunk view, batch composition, exact LLM payloads and
 responses, redaction diff, recall report and canary probes. API keys are
 entered in Settings and stored only in the gitignored `data/settings.json`,
 echoed back masked.
@@ -124,7 +125,7 @@ Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q          # 368 tests should pass
+.venv/bin/pytest -q          # 373 tests should pass
 ```
 
 On macOS, `python3` may point at the system interpreter shipped with Xcode,
