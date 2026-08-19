@@ -86,6 +86,15 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = PROJECT_ROOT / "webapp" / "static"
 INDEX_FILENAME = "index.html"
+STATIC_URL_PREFIX = "/static/"
+
+# Frontend files are served without a Cache-Control header by default, which
+# lets browsers apply heuristic freshness and keep serving a stale app.js for
+# days after a deploy without ever asking the server. "no-cache" means "store,
+# but revalidate every time": with the ETag StaticFiles already sends, an
+# unchanged file costs one cheap 304 and a changed one is picked up at once.
+CACHE_CONTROL_HEADER = "Cache-Control"
+STATIC_CACHE_CONTROL = "no-cache"
 
 # Server logs are kept for backtesting; the directory is gitignored.
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -214,11 +223,15 @@ def get_settings_path() -> Path:
 def get_store(config: AppConfig) -> ChunkStore:
     """Open the chunk store for one request.
 
-    A store per request rather than a shared one: its SQLite connection belongs
-    to the thread that created it, and FastAPI runs these endpoints in a thread
-    pool.
+    A store per request, and with the cross-thread guard off: FastAPI runs a
+    sync dependency, the endpoint body and the dependency's cleanup each on
+    whatever thread-pool worker is free, so one request's store hops threads.
+    The hops are sequential - a request never runs two store calls at once -
+    which is exactly the case `allow_cross_thread` exists for. With the guard
+    on, a request whose dependency and endpoint landed on different workers
+    died with sqlite3.ProgrammingError.
     """
-    return ChunkStore(config.database.path)
+    return ChunkStore(config.database.path, allow_cross_thread=True)
 
 
 def get_chunker(config: AppConfig) -> Chunker:
@@ -372,6 +385,16 @@ async def config_error_handler(request: Request, exc: ConfigError) -> JSONRespon
     """Report a configuration problem as a 400 carrying its own message."""
     logger.warning("Configuration error on %s: %s", request.url.path, exc)
     return JSONResponse(status_code=HTTP_BAD_REQUEST, content={"detail": str(exc)})
+
+
+@app.middleware("http")
+async def revalidate_frontend(request: Request, call_next):
+    """Make browsers revalidate the frontend files on every load."""
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith(STATIC_URL_PREFIX):
+        response.headers[CACHE_CONTROL_HEADER] = STATIC_CACHE_CONTROL
+    return response
 
 
 @app.middleware("http")
