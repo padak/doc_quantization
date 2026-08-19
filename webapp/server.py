@@ -8,8 +8,12 @@ here - chunking, synthetic mixing, answer parsing and redaction are imported
 from `doc_quant`.
 
 Detection is synchronous here, unlike the CLI's Batches API path: one
-`messages.create` call per fragment, so a user watches the requests go out one
-by one instead of waiting for a batch to finish. The payload is deliberately
+`messages.create` call per fragment, a few of them in flight at a time
+(`anthropic.detect_concurrency`), so a user watches the requests go out instead
+of waiting for a batch to finish. It is also streamed: the
+endpoint answers with newline-delimited JSON and emits an event as each step
+completes, so the wait is observable rather than a blank several minutes. The
+payload is deliberately
 identical to the batch path - same system prompt, schema, effort and
 max_tokens, built from the very dict this endpoint reports back as
 `payload_template` - so what is observed here is what the batch path sends. The
@@ -33,13 +37,15 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import anthropic
+import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from markitdown import FileConversionException, MarkItDown, UnsupportedFormatException
 from pydantic import BaseModel
@@ -64,6 +70,7 @@ from doc_quant.synthetic import (
 from webapp.settings import (
     DEFAULT_SETTINGS_PATH,
     MISSING_API_KEY_MESSAGE,
+    SettingValue,
     effective_api_key,
     effective_config,
     load_overrides,
@@ -109,6 +116,48 @@ STATUS_ERROR = "error"
 REFUSAL_STOP_REASON = "refusal"
 
 NO_UNSUBMITTED_CHUNKS_MESSAGE = "no unsubmitted chunks"
+
+# Detection progress protocol: one JSON object per line, each carrying a
+# "type". The frontend switches on these, so they are part of the API.
+NDJSON_MEDIA_TYPE = "application/x-ndjson"
+EVENT_PHASE = "phase"
+EVENT_SYNTHETIC = "synthetic"
+EVENT_SUBMITTED = "submitted"
+EVENT_RESULT = "result"
+EVENT_DONE = "done"
+EVENT_ERROR = "error"
+
+PHASE_PLANNING = "planning"
+PHASE_SYNTHETICS = "synthetics"
+PHASE_CANARIES = "canaries"
+PHASE_CANARIES_DETAIL = "ensuring canary set"
+PHASE_SYNTHETICS_TEMPLATE_DETAIL = "deterministic templates (local LLM disabled)"
+
+# Preflight checks reported by /api/verify.
+CHECK_ANTHROPIC = "anthropic"
+CHECK_LOCAL_LLM = "local_llm"
+CHECK_MARKITDOWN = "markitdown"
+CHECK_DATABASE = "database"
+CHECK_LABELS = {
+    CHECK_ANTHROPIC: "Anthropic API",
+    CHECK_LOCAL_LLM: "Local LLM",
+    CHECK_MARKITDOWN: "Document conversion",
+    CHECK_DATABASE: "Database",
+}
+VERIFY_NO_KEY_DETAIL = (
+    "No Anthropic API key stored: add one in Settings (or set the "
+    "ANTHROPIC_API_KEY environment variable)."
+)
+# The preflight must answer quickly even when the local endpoint is dead, so it
+# uses its own short timeout rather than the generation timeout from the config.
+VERIFY_HTTP_TIMEOUT_SECONDS = 5.0
+VERIFY_LLM_DISABLED_DETAIL = (
+    "skipped - local LLM disabled, deterministic templates in use"
+)
+MODELS_PATH = "/models"
+OLLAMA_DEFAULT_TAG = ":latest"
+VERIFY_SAMPLE_NAME = "preflight.html"
+VERIFY_SAMPLE_HTML = b"<html><body><h1>Preflight</h1><p>Conversion works.</p></body></html>"
 
 HTTP_BAD_REQUEST = 400
 HTTP_NOT_FOUND = 404
@@ -183,6 +232,20 @@ def get_generator(config: AppConfig, store: ChunkStore) -> Any:
     return SyntheticGenerator(config, store)
 
 
+def get_markitdown() -> Any:
+    """Build the document converter."""
+    return MarkItDown()
+
+
+def get_http_client() -> Any:
+    """Build the HTTP client used to reach the local LLM endpoint.
+
+    Separate from `doc_quant.synthetic`'s own client: this one only ever asks a
+    server what it can do, and must give up quickly when nothing answers.
+    """
+    return httpx.Client(timeout=VERIFY_HTTP_TIMEOUT_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # request context
 # ---------------------------------------------------------------------------
@@ -193,7 +256,7 @@ class RequestContext:
     """Everything one request needs to know about how the app is configured."""
 
     config: AppConfig
-    overrides: dict[str, str]
+    overrides: dict[str, SettingValue]
     api_key: str | None
 
 
@@ -231,6 +294,7 @@ class SettingsUpdate(BaseModel):
     effort: str | None = None
     llm_base_url: str | None = None
     llm_model: str | None = None
+    llm_enabled: bool | None = None
 
 
 class DetectRequest(BaseModel):
@@ -328,6 +392,7 @@ def _settings_payload(context: RequestContext) -> dict:
         "effort": config.anthropic.effort,
         "llm_base_url": config.synthetic.llm.base_url,
         "llm_model": config.synthetic.llm.model,
+        "llm_enabled": config.synthetic.llm.enabled,
         "chunk_size_tokens": config.chunking.chunk_size_tokens,
         "chaff_ratio": config.synthetic.chaff_ratio,
         "honeytoken_rate": config.synthetic.honeytoken_rate,
@@ -435,7 +500,7 @@ def _to_markdown(filename: str, raw: bytes) -> str:
         source = Path(directory) / f"{UPLOAD_STEM}{suffix}"
         source.write_bytes(raw)
         try:
-            result = MarkItDown().convert(source)
+            result = get_markitdown().convert(source)
         except (
             FileConversionException,
             UnsupportedFormatException,
@@ -465,21 +530,31 @@ def _chunk_payloads(
 ) -> list[dict]:
     """Describe every chunk of a document, down to its individual tokens.
 
+    `tokens` carries display segments rather than one string per token: a
+    character whose bytes span two tokens has no faithful per-token rendering,
+    and showing "Petr ??imecek" would misrepresent the very text the pipeline
+    handles losslessly. The segments join back to the chunk text exactly.
+
+    `token_count` stays the real token count - it is what the configured chunk
+    size is expressed in - so it may exceed the number of segments on text with
+    multi-byte characters.
+
     `extended` marks a chunk that came out longer than the configured size:
     that is the visible trace of a boundary the chunker pushed forward to keep
     a name run whole.
     """
     payloads = []
     for chunk in store.get_document_chunks(doc_id):
-        tokens = chunker.token_strings(chunk["text"])
+        segments = chunker.token_display_segments(chunk["text"])
+        token_count = len(chunker.token_strings(chunk["text"]))
         payloads.append(
             {
                 "chunk_id": chunk["chunk_id"],
                 "seq": chunk["seq"],
-                "token_count": len(tokens),
+                "token_count": token_count,
                 "text": chunk["text"],
-                "tokens": tokens,
-                "extended": len(tokens) > config.chunking.chunk_size_tokens,
+                "tokens": segments,
+                "extended": token_count > config.chunking.chunk_size_tokens,
             }
         )
     return payloads
@@ -514,18 +589,71 @@ class DetectionOutcome:
     detail: str | None
 
 
+class _CountingProbe:
+    """Stands in for the generator so a plan can be costed without running it.
+
+    The mixing math must exist in exactly one place
+    (`plan_synthetic_fragments`), yet the stream needs to know how many
+    honeytokens and chaff fragments a submission of this size carries *before*
+    generating them one at a time. So the plan is run against this probe, which
+    records the counts it is asked for and generates nothing.
+    """
+
+    def __init__(self) -> None:
+        self.honeytokens = 0
+        self.chaff = 0
+
+    def make_honeytokens(self, count: int) -> list:
+        self.honeytokens = count
+        return []
+
+    def make_chaff(self, count: int) -> list:
+        self.chaff = count
+        return []
+
+    def ensure_canaries(self) -> list:
+        return []
+
+
+class _CanaryProbe:
+    """Runs only the canary half of a plan, so its sampling stays shared.
+
+    The canary set is persistent and its per-batch sample size is decided by
+    `plan_synthetic_fragments`; letting the plan do that work while the other
+    two mechanisms answer with nothing keeps that decision in one place too.
+    """
+
+    def __init__(self, generator: Any) -> None:
+        self._generator = generator
+
+    def make_honeytokens(self, count: int) -> list:
+        return []
+
+    def make_chaff(self, count: int) -> list:
+        return []
+
+    def ensure_canaries(self) -> list:
+        return self._generator.ensure_canaries()
+
+
 @app.post("/api/detect")
 def detect(
     request: DetectRequest,
     context: RequestContext = Depends(context_dependency),
     store: ChunkStore = Depends(store_dependency),
-) -> dict:
-    """Run detection over one document's not-yet-submitted chunks.
+) -> StreamingResponse:
+    """Run detection over one document's not-yet-submitted chunks, streaming.
 
     The chunks are mixed with freshly generated synthetic fragments and
     shuffled exactly as the batch path mixes and shuffles them, then sent one
-    request at a time. The response reports the submission order, so a reader
-    can see the same sequence the provider saw.
+    request at a time. The answer is newline-delimited JSON: a `phase` and
+    `synthetic` event per generation step, one `submitted` event carrying the
+    whole submission in provider order, one `result` event per provider call as
+    it completes, and a final `done` event carrying the complete run.
+
+    Everything that can fail before the first byte is checked here rather than
+    in the stream, so an unknown document, an already-detected one and a
+    missing API key stay ordinary HTTP errors with a status code.
     """
     _require_document(store, request.doc_id)
     chunks = [
@@ -541,9 +669,100 @@ def detect(
     # Before anything is generated or marked as submitted: a missing key must
     # leave the document exactly as it was.
     client = get_anthropic_client(context.api_key)
-
     generator = get_generator(context.config, store)
-    fragments = plan_synthetic_fragments(context.config, lambda: generator, len(chunks))
+
+    return StreamingResponse(
+        _detect_events(context.config, store, client, generator, chunks),
+        media_type=NDJSON_MEDIA_TYPE,
+    )
+
+
+def _detect_events(
+    config: AppConfig,
+    store: ChunkStore,
+    client: Any,
+    generator: Any,
+    chunks: list[dict],
+) -> Iterator[str]:
+    """Wrap the run so a mid-stream failure still reaches the reader.
+
+    The status line is long gone by then, so the only way to report a break is
+    a last event saying so.
+    """
+    try:
+        yield from _run_detection_stream(config, store, client, generator, chunks)
+    except Exception as exc:  # noqa: BLE001 - the stream must not die silently
+        logger.exception("Detection stream failed")
+        yield _ndjson({"type": EVENT_ERROR, "detail": _readable(exc)})
+
+
+def _run_detection_stream(
+    config: AppConfig,
+    store: ChunkStore,
+    client: Any,
+    generator: Any,
+    chunks: list[dict],
+) -> Iterator[str]:
+    """Generate, submit and collect, emitting one event per finished step."""
+    yield _ndjson(_phase_event(PHASE_PLANNING, f"{len(chunks)} real fragments"))
+
+    counts = _CountingProbe()
+    plan_synthetic_fragments(config, lambda: counts, len(chunks))
+
+    synthetic_config = config.synthetic
+    if (
+        synthetic_config.honeytokens_enabled
+        or synthetic_config.chaff_enabled
+        or synthetic_config.canaries_enabled
+    ):
+        llm = synthetic_config.llm
+        detail = (
+            f"generating via {llm.model} at {llm.base_url}"
+            if llm.enabled
+            else PHASE_SYNTHETICS_TEMPLATE_DETAIL
+        )
+        yield _ndjson(_phase_event(PHASE_SYNTHETICS, detail))
+
+    fragments: list[Any] = []
+    # One fragment per call rather than one call per kind: the point of the
+    # stream is that a slow local model is visible while it works.
+    for kind, make, total in (
+        (KIND_HONEYTOKEN, generator.make_honeytokens, counts.honeytokens),
+        (KIND_CHAFF, generator.make_chaff, counts.chaff),
+    ):
+        for index in range(1, total + 1):
+            made = make(1)
+            if not made:
+                # The mechanism answered with nothing (it is switched off);
+                # there is no fragment to report.
+                break
+            fragments.extend(made)
+            yield _ndjson(
+                {
+                    "type": EVENT_SYNTHETIC,
+                    "kind": kind,
+                    "index": index,
+                    "total": total,
+                    "fragment_id": made[0].fragment_id,
+                }
+            )
+
+    if synthetic_config.canaries_enabled:
+        yield _ndjson(_phase_event(PHASE_CANARIES, PHASE_CANARIES_DETAIL))
+    canaries = plan_synthetic_fragments(
+        config, lambda: _CanaryProbe(generator), len(chunks)
+    )
+    for index, canary in enumerate(canaries, start=1):
+        yield _ndjson(
+            {
+                "type": EVENT_SYNTHETIC,
+                "kind": KIND_CANARY,
+                "index": index,
+                "total": len(canaries),
+                "fragment_id": canary.fragment_id,
+            }
+        )
+    fragments.extend(canaries)
 
     planned = [
         {
@@ -575,7 +794,23 @@ def detect(
             [fragment.fragment_id for fragment in fragments], batch_id
         )
 
-    template = _payload_template(context.config)
+    template = _payload_template(config)
+    by_kind = Counter(fragment.kind for fragment in fragments)
+    composition = {KIND_REAL: len(chunks)}
+    composition.update({kind: by_kind[kind] for kind in SYNTHETIC_KINDS})
+
+    # Emitted after the shuffle and the marking, before the first provider
+    # call: this is exactly what is about to leave the machine, in order.
+    yield _ndjson(
+        {
+            "type": EVENT_SUBMITTED,
+            "batch_id": batch_id,
+            "composition": composition,
+            "payload_template": template,
+            "requests": planned,
+        }
+    )
+
     planted_by_id = {
         fragment.fragment_id: fragment.planted
         for fragment in fragments
@@ -585,10 +820,26 @@ def detect(
     results: list[dict] = []
     entities_stored = 0
     honeytokens_found = 0
-    for item in planned:
-        outcome = _run_detection(client, template, item["text"])
-        results.append(
-            {
+    # A worker does one thing: send a fragment and time the answer. It touches
+    # no store and no shared mutable state, so every SQLite write - and every
+    # decision about where a result belongs - stays on this thread by design:
+    # the store's connection belongs to the thread that opened it, and the
+    # routing rules are easier to trust in one sequential place. The Anthropic
+    # client is shared: the SDK's client is safe to send requests from several
+    # threads.
+    workers = max(1, config.anthropic.detect_concurrency)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(_run_detection, client, template, item["text"]): item
+            for item in planned
+        }
+        # Completion order, not submission order: a result is reported the
+        # moment it lands, which is the whole point of running several at once.
+        for index, future in enumerate(as_completed(futures), start=1):
+            item = futures[future]
+            outcome = future.result()
+            result = {
                 "custom_id": item["custom_id"],
                 "kind": item["kind"],
                 "status": outcome.status,
@@ -597,39 +848,58 @@ def detect(
                 "latency_ms": outcome.latency_ms,
                 "detail": outcome.detail,
             }
-        )
-        if outcome.status != STATUS_OK:
-            continue
-        if item["kind"] == KIND_REAL:
-            store.add_entities(item["custom_id"], outcome.entities)
-            entities_stored += len(outcome.entities)
-        elif item["kind"] == KIND_HONEYTOKEN:
-            store.record_honeytoken_result(item["custom_id"], batch_id, outcome.entities)
-            found_names = {name for name, _ in outcome.entities}
-            honeytokens_found += sum(
-                1
-                for name, _ in planted_by_id[item["custom_id"]]
-                if name in found_names
+            results.append(result)
+            yield _ndjson(
+                {"type": EVENT_RESULT, "index": index, "total": len(planned), **result}
             )
-        # Chaff exists to dilute and a canary to be answered about later; what
-        # the model reported about either of them is of no interest.
+
+            if outcome.status != STATUS_OK:
+                continue
+            if item["kind"] == KIND_REAL:
+                store.add_entities(item["custom_id"], outcome.entities)
+                entities_stored += len(outcome.entities)
+            elif item["kind"] == KIND_HONEYTOKEN:
+                store.record_honeytoken_result(
+                    item["custom_id"], batch_id, outcome.entities
+                )
+                found_names = {name for name, _ in outcome.entities}
+                honeytokens_found += sum(
+                    1
+                    for name, _ in planted_by_id[item["custom_id"]]
+                    if name in found_names
+                )
+            # Chaff exists to dilute and a canary to be answered about later;
+            # what the model reported about either of them is of no interest.
+    finally:
+        # A reader that walks away must not keep the run going: whatever is
+        # still queued is dropped rather than waited for.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     store.set_batch_status(batch_id, BATCH_STATUS_SYNC_COMPLETED)
-
-    by_kind = Counter(fragment.kind for fragment in fragments)
-    composition = {KIND_REAL: len(chunks)}
-    composition.update({kind: by_kind[kind] for kind in SYNTHETIC_KINDS})
     logger.info("Sync batch %s finished: %s", batch_id, composition)
 
-    return {
-        "batch_id": batch_id,
-        "composition": composition,
-        "payload_template": template,
-        "requests": planned,
-        "results": results,
-        "honeytoken_recall": _honeytoken_recall(planted_by_id, honeytokens_found),
-        "entities_stored": entities_stored,
-    }
+    yield _ndjson(
+        {
+            "type": EVENT_DONE,
+            "batch_id": batch_id,
+            "composition": composition,
+            "payload_template": template,
+            "requests": planned,
+            "results": results,
+            "honeytoken_recall": _honeytoken_recall(planted_by_id, honeytokens_found),
+            "entities_stored": entities_stored,
+        }
+    )
+
+
+def _phase_event(phase: str, detail: str) -> dict:
+    """Build a progress event announcing which step is now running."""
+    return {"type": EVENT_PHASE, "phase": phase, "detail": detail}
+
+
+def _ndjson(event: dict) -> str:
+    """Render one event as a line of newline-delimited JSON."""
+    return json.dumps(event, ensure_ascii=False) + "\n"
 
 
 def _payload_template(config: AppConfig) -> dict:
@@ -734,6 +1004,177 @@ def synthetic_report(store: ChunkStore = Depends(store_dependency)) -> dict:
         "honeytoken_stats": store.honeytoken_stats(),
         "canary_probes": store.list_canary_probes(),
     }
+
+
+@app.post("/api/verify")
+def verify(context: RequestContext = Depends(context_dependency)) -> dict:
+    """Check every external dependency the pipeline needs before a run.
+
+    Each check is independent, timed and never raises: a broken one is a
+    reported failure, not a 500, because the whole point is to tell the user
+    which piece of their environment is missing.
+    """
+    checks = [
+        _check_anthropic(context),
+        _check_local_llm(context.config),
+        _check_markitdown(),
+        _check_database(context.config),
+    ]
+    all_ok = all(check["ok"] for check in checks)
+    logger.info(
+        "Preflight: %s",
+        ", ".join(f"{check['name']}={'ok' if check['ok'] else 'failed'}" for check in checks),
+    )
+    return {"checks": checks, "all_ok": all_ok}
+
+
+def _check(name: str, ok: bool, detail: str, started: float) -> dict:
+    """Render one finished check."""
+    return {
+        "name": name,
+        "label": CHECK_LABELS[name],
+        "ok": ok,
+        "detail": detail,
+        "latency_ms": _elapsed_ms(started),
+    }
+
+
+def _check_anthropic(context: RequestContext) -> dict:
+    """Confirm that the stored key can retrieve the configured model."""
+    started = time.perf_counter()
+    model = context.config.anthropic.model
+    if not context.api_key:
+        return _check(CHECK_ANTHROPIC, False, VERIFY_NO_KEY_DETAIL, started)
+
+    try:
+        client = get_anthropic_client(context.api_key)
+        retrieved = client.models.retrieve(model)
+    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
+        logger.warning("Preflight: Anthropic check failed: %s", exc)
+        return _check(CHECK_ANTHROPIC, False, _readable(exc), started)
+
+    model_id = getattr(retrieved, "id", None) or model
+    return _check(CHECK_ANTHROPIC, True, f"model {model_id} confirmed", started)
+
+
+def _check_local_llm(config: AppConfig) -> dict:
+    """Confirm the local endpoint answers and knows the configured model.
+
+    The endpoint is optional: with the local LLM switched off the generator
+    phrases its fragments from deterministic templates, so nothing is probed
+    and the check passes - a component deliberately not in use must not report
+    the environment as broken.
+    """
+    started = time.perf_counter()
+    llm = config.synthetic.llm
+    if not llm.enabled:
+        return _check(CHECK_LOCAL_LLM, True, VERIFY_LLM_DISABLED_DETAIL, started)
+
+    base_url = llm.base_url.rstrip("/")
+    hint = f"start it: ollama serve && ollama pull {llm.model}"
+
+    try:
+        client = get_http_client()
+        try:
+            response = client.get(f"{base_url}{MODELS_PATH}")
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - unreachable is a normal outcome
+        logger.warning("Preflight: local LLM unreachable at %s: %s", base_url, exc)
+        return _check(
+            CHECK_LOCAL_LLM, False, f"{base_url} unreachable ({exc}); {hint}", started
+        )
+
+    status_code = getattr(response, "status_code", None)
+    if status_code != 200:
+        return _check(
+            CHECK_LOCAL_LLM,
+            False,
+            f"{base_url}{MODELS_PATH} answered HTTP {status_code}; {hint}",
+            started,
+        )
+
+    try:
+        model_ids = [item["id"] for item in response.json()["data"]]
+    except (ValueError, KeyError, TypeError) as exc:
+        return _check(
+            CHECK_LOCAL_LLM,
+            False,
+            f"{base_url}{MODELS_PATH} returned an unexpected payload ({exc})",
+            started,
+        )
+
+    if _serves_model(llm.model, model_ids):
+        return _check(
+            CHECK_LOCAL_LLM, True, f"{base_url} serves {llm.model}", started
+        )
+    available = ", ".join(model_ids) if model_ids else "none"
+    return _check(
+        CHECK_LOCAL_LLM,
+        False,
+        f"{base_url} does not serve {llm.model}; available: {available}",
+        started,
+    )
+
+
+def _serves_model(model: str, model_ids: list[str]) -> bool:
+    """Whether `model` is among `model_ids`.
+
+    Ollama reports a pulled model under its full tag, so a configured
+    "llama3.2" is served by "llama3.2:latest"; that one implicit tag is
+    accepted, anything else has to match exactly.
+    """
+    return model in model_ids or f"{model}{OLLAMA_DEFAULT_TAG}" in model_ids
+
+
+def _check_markitdown() -> dict:
+    """Convert a tiny HTML document to prove the converter is usable."""
+    started = time.perf_counter()
+    try:
+        markdown = _to_markdown(VERIFY_SAMPLE_NAME, VERIFY_SAMPLE_HTML)
+    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
+        logger.warning("Preflight: markitdown check failed: %s", exc)
+        return _check(CHECK_MARKITDOWN, False, _readable(exc), started)
+
+    if not markdown.strip():
+        return _check(
+            CHECK_MARKITDOWN, False, "conversion returned no markdown", started
+        )
+    return _check(
+        CHECK_MARKITDOWN,
+        True,
+        f"converted a sample document to {len(markdown)} characters of markdown",
+        started,
+    )
+
+
+def _check_database(config: AppConfig) -> dict:
+    """Open the store to prove the database file exists and is writable.
+
+    Opening it is the write: `ChunkStore` runs its schema script and commits
+    before returning, so a missing directory or a read-only file fails here.
+    """
+    started = time.perf_counter()
+    path = config.database.path
+    try:
+        store = get_store(config)
+        try:
+            documents = len(store.list_documents())
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
+        logger.warning("Preflight: database check failed: %s", exc)
+        return _check(CHECK_DATABASE, False, _readable(exc), started)
+
+    return _check(
+        CHECK_DATABASE, True, f"{path} is writable ({documents} documents)", started
+    )
+
+
+def _readable(exc: Exception) -> str:
+    """Render an exception for a user: its message, or its type when silent."""
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
 
 
 @app.post("/api/canary-probe")

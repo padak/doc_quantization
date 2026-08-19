@@ -42,6 +42,10 @@ class AnthropicConfig:
     model: str
     effort: str
     max_tokens: int
+    # How many detection requests the synchronous (web app) path keeps in
+    # flight. The Batches API path is unaffected: it hands the whole batch to
+    # the provider at once and has nothing to parallelize.
+    detect_concurrency: int
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,7 @@ class SyntheticLLMConfig:
     endpoint is expected to stay on the machine running this tool.
     """
 
+    enabled: bool
     base_url: str
     model: str
     temperature: float
@@ -142,6 +147,9 @@ def load_config(path: Path | None = None) -> AppConfig:
         model=_require(raw["anthropic"], "model", "anthropic"),
         effort=_require(raw["anthropic"], "effort", "anthropic"),
         max_tokens=int(_require(raw["anthropic"], "max_tokens", "anthropic")),
+        detect_concurrency=int(
+            _require(raw["anthropic"], "detect_concurrency", "anthropic")
+        ),
     )
     redaction = RedactionConfig(
         person=_require(raw["redaction"], "person", "redaction"),
@@ -165,6 +173,7 @@ def _load_synthetic(raw: dict) -> SyntheticConfig:
             f"Config key synthetic.llm must be an object, got {type(raw_llm).__name__}"
         )
     llm = SyntheticLLMConfig(
+        enabled=_require_bool(raw_llm, "enabled", "synthetic.llm"),
         base_url=_require(raw_llm, "base_url", "synthetic.llm"),
         model=_require(raw_llm, "model", "synthetic.llm"),
         temperature=float(_require(raw_llm, "temperature", "synthetic.llm")),

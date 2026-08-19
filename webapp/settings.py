@@ -19,13 +19,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
-from doc_quant.config import (
-    PROJECT_ROOT,
-    AnthropicConfig,
-    AppConfig,
-    ConfigError,
-    SyntheticLLMConfig,
-)
+from doc_quant.config import PROJECT_ROOT, AppConfig, ConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +34,21 @@ API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 # Every key a user may override. Anything else found in the file is ignored
 # rather than rejected, so a settings file written by a newer build does not
 # break an older one.
+BOOL_SETTINGS_KEYS: tuple[str, ...] = ("llm_enabled",)
+
 SETTINGS_KEYS: tuple[str, ...] = (
     API_KEY_SETTING,
     "model",
     "effort",
     "llm_base_url",
     "llm_model",
+    *BOOL_SETTINGS_KEYS,
 )
+
+# A setting value is a string, except for the switches, which are real
+# booleans: "false" read as a string would be a true value, and a switch that
+# silently means its opposite is worse than no switch at all.
+SettingValue = str | bool
 
 # Structural constants of the mask, not tunables: how much of a key stays
 # readable so a user can tell which key is stored, and the elision between the
@@ -60,15 +62,18 @@ MISSING_API_KEY_MESSAGE = (
 )
 
 
-def load_overrides(path: Path) -> dict[str, str]:
+def load_overrides(path: Path) -> dict[str, SettingValue]:
     """Read the user overrides from `path`.
 
     A missing file is normal and yields an empty mapping. Empty string values
     are dropped here as well as on write, so "cleared" and "never set" behave
-    identically no matter how the file came to be.
+    identically no matter how the file came to be. A switch (see
+    `BOOL_SETTINGS_KEYS`) is kept whichever way it points: False is a decision,
+    not an absent value.
 
     Raises:
-        ConfigError: when the file exists but is not a JSON object of strings.
+        ConfigError: when the file exists but is not a JSON object whose values
+            have the type their key calls for.
     """
     if not path.exists():
         logger.debug("No settings file at %s; using config defaults only", path)
@@ -84,10 +89,17 @@ def load_overrides(path: Path) -> dict[str, str]:
             f"got {type(raw).__name__}"
         )
 
-    overrides: dict[str, str] = {}
+    overrides: dict[str, SettingValue] = {}
     for key in SETTINGS_KEYS:
         value = raw.get(key)
         if value is None:
+            continue
+        if key in BOOL_SETTINGS_KEYS:
+            if not isinstance(value, bool):
+                raise ConfigError(
+                    f"Settings key {key} must be a boolean, got {type(value).__name__}"
+                )
+            overrides[key] = value
             continue
         if not isinstance(value, str):
             raise ConfigError(
@@ -102,12 +114,15 @@ def load_overrides(path: Path) -> dict[str, str]:
     return overrides
 
 
-def save_overrides(path: Path, updates: dict[str, str | None]) -> dict[str, str]:
+def save_overrides(
+    path: Path, updates: dict[str, SettingValue | None]
+) -> dict[str, SettingValue]:
     """Merge `updates` into the stored overrides and write them back.
 
     A key mapped to None or to the empty string is removed, which is how the
     user clears an override (including the API key) and falls back to the
-    config default or the environment.
+    config default or the environment. A switch set to False is stored rather
+    than removed: switching something off is an override like any other.
 
     Returns:
         The merged overrides as they were persisted.
@@ -122,7 +137,7 @@ def save_overrides(path: Path, updates: dict[str, str | None]) -> dict[str, str]
 
     merged = load_overrides(path)
     for key, value in updates.items():
-        if not value:
+        if value is None or value == "":
             merged.pop(key, None)
         else:
             merged[key] = value
@@ -136,23 +151,27 @@ def save_overrides(path: Path, updates: dict[str, str | None]) -> dict[str, str]
     return merged
 
 
-def effective_config(config: AppConfig, overrides: dict[str, str]) -> AppConfig:
+def effective_config(config: AppConfig, overrides: dict[str, SettingValue]) -> AppConfig:
     """Return `config` with the user overrides applied.
 
-    Only the four non-secret settings are part of the returned config; the API
-    key is handled by `effective_api_key`, so an `AppConfig` never carries a
-    secret and can be logged or inspected freely.
+    Only the non-secret settings are part of the returned config; the API key
+    is handled by `effective_api_key`, so an `AppConfig` never carries a secret
+    and can be logged or inspected freely.
+
+    The overridable fields are patched onto the loaded dataclasses rather than
+    rebuilt from scratch, so a tunable that is not overridable here keeps
+    whatever `config/config.json` said about it.
     """
-    anthropic_config = AnthropicConfig(
-        model=overrides.get("model") or config.anthropic.model,
-        effort=overrides.get("effort") or config.anthropic.effort,
-        max_tokens=config.anthropic.max_tokens,
+    anthropic_config = replace(
+        config.anthropic,
+        model=_text(overrides, "model") or config.anthropic.model,
+        effort=_text(overrides, "effort") or config.anthropic.effort,
     )
-    llm_config = SyntheticLLMConfig(
-        base_url=overrides.get("llm_base_url") or config.synthetic.llm.base_url,
-        model=overrides.get("llm_model") or config.synthetic.llm.model,
-        temperature=config.synthetic.llm.temperature,
-        timeout_seconds=config.synthetic.llm.timeout_seconds,
+    llm_config = replace(
+        config.synthetic.llm,
+        enabled=effective_llm_enabled(config, overrides),
+        base_url=_text(overrides, "llm_base_url") or config.synthetic.llm.base_url,
+        model=_text(overrides, "llm_model") or config.synthetic.llm.model,
     )
     return replace(
         config,
@@ -161,17 +180,36 @@ def effective_config(config: AppConfig, overrides: dict[str, str]) -> AppConfig:
     )
 
 
-def effective_api_key(overrides: dict[str, str]) -> str | None:
+def effective_llm_enabled(config: AppConfig, overrides: dict[str, SettingValue]) -> bool:
+    """Whether the local LLM may be contacted at all.
+
+    With it off, `doc_quant.synthetic` phrases every fragment from its
+    deterministic templates, so the pipeline runs with nothing installed
+    locally.
+    """
+    stored = overrides.get("llm_enabled")
+    if isinstance(stored, bool):
+        return stored
+    return config.synthetic.llm.enabled
+
+
+def effective_api_key(overrides: dict[str, SettingValue]) -> str | None:
     """Return the API key to use, or None when none is configured.
 
     The stored setting wins over the environment: a key typed into the app is
     the more deliberate of the two.
     """
-    stored = overrides.get(API_KEY_SETTING)
+    stored = _text(overrides, API_KEY_SETTING)
     if stored:
         return stored
     from_env = os.environ.get(API_KEY_ENV_VAR)
     return from_env or None
+
+
+def _text(overrides: dict[str, SettingValue], key: str) -> str | None:
+    """Return a string-valued override, or None when it is absent."""
+    value = overrides.get(key)
+    return value if isinstance(value, str) and value else None
 
 
 def mask_api_key(key: str | None) -> str | None:

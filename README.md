@@ -145,6 +145,7 @@ All tunables live in `config/config.json`:
 | `anthropic.model` | `claude-opus-5` | Detection model |
 | `anthropic.effort` | `low` | Reasoning effort for detection requests |
 | `anthropic.max_tokens` | `1024` | Max output tokens per request |
+| `anthropic.detect_concurrency` | `6` | Detection requests kept in flight by the web app's synchronous path |
 | `redaction.person` | `**PERSON**` | Placeholder for person names |
 | `redaction.company` | `**COMPANY**` | Placeholder for company names |
 | `synthetic.honeytokens_enabled` | `true` | Mix honeytokens into batches |

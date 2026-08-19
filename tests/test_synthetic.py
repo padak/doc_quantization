@@ -64,6 +64,7 @@ def make_config(tmp_path: Path, **synthetic_overrides) -> AppConfig:
         canaries_per_batch=2,
         seed=SEED,
         llm=SyntheticLLMConfig(
+            enabled=True,
             base_url=BASE_URL,
             model=MODEL,
             temperature=0.8,
@@ -77,7 +78,9 @@ def make_config(tmp_path: Path, **synthetic_overrides) -> AppConfig:
             name_run_max_extension_tokens=12,
         ),
         database=DatabaseConfig(path=tmp_path / "chunks.db"),
-        anthropic=AnthropicConfig(model="claude-opus-5", effort="low", max_tokens=1024),
+        anthropic=AnthropicConfig(
+            model="claude-opus-5", effort="low", max_tokens=1024, detect_concurrency=6
+        ),
         redaction=RedactionConfig(person="**PERSON**", company="**COMPANY**"),
         synthetic=replace(synthetic, **synthetic_overrides),
     )
@@ -568,6 +571,7 @@ def test_unreachable_server_is_not_swallowed(tmp_path: Path, store: ChunkStore) 
 def test_the_llm_client_is_built_lazily(tmp_path: Path, store: ChunkStore) -> None:
     """Nothing is contacted while there is nothing to generate."""
     config = make_config(tmp_path, llm=SyntheticLLMConfig(
+        enabled=True,
         base_url="http://127.0.0.1:1/v1",
         model=MODEL,
         temperature=0.8,
@@ -577,6 +581,37 @@ def test_the_llm_client_is_built_lazily(tmp_path: Path, store: ChunkStore) -> No
 
     assert generator.make_honeytokens(0) == []
     assert generator.make_chaff(0) == []
+
+
+class _ExplodingLLM:
+    """Fails the test if the generator touches the LLM at all."""
+
+    def generate(self, prompt: str, seed: int) -> str:
+        raise AssertionError("LLM must not be called when synthetic.llm.enabled is false")
+
+
+def test_disabled_llm_uses_templates_directly(tmp_path: Path, store: ChunkStore) -> None:
+    """With synthetic.llm.enabled=false, templates are used with no LLM contact."""
+    config = make_config(tmp_path, llm=SyntheticLLMConfig(
+        enabled=False,
+        base_url="http://127.0.0.1:1/v1",
+        model=MODEL,
+        temperature=0.8,
+        timeout_seconds=0.1,
+    ))
+    generator = SyntheticGenerator(config, store, llm=_ExplodingLLM())
+
+    honeytokens = generator.make_honeytokens(2)
+    chaff = generator.make_chaff(2)
+    canaries = generator.ensure_canaries()
+
+    for fragment in honeytokens + chaff:
+        for name, _kind in fragment.planted:
+            assert name in fragment.text
+    for canary in canaries:
+        assert canary.fact is not None
+        assert canary.fact in canary.text
+    assert store.get_synthetic_fragment(honeytokens[0].fragment_id) is not None
 
 
 # ----------------------------------------------------------------------

@@ -11,7 +11,11 @@ settings file instead.
 from __future__ import annotations
 
 import json
+import random
+import sqlite3
+import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +36,12 @@ from doc_quant.synthetic import (
     SyntheticFragment,
 )
 from webapp import server
+from webapp.server import (
+    NDJSON_MEDIA_TYPE,
+    PHASE_SYNTHETICS_TEMPLATE_DETAIL,
+    VERIFY_LLM_DISABLED_DETAIL,
+    VERIFY_NO_KEY_DETAIL,
+)
 from webapp.settings import MISSING_API_KEY_MESSAGE
 
 DUMMY_API_KEY = "sk-ant-testing-0123456789wxyz"
@@ -43,6 +53,12 @@ Jan Novak met Petra Svobodova at the Keboola office in Prague to discuss the
 migration plan for the reporting warehouse. The team agreed to ship the new
 connector before the end of the quarter and to review the remaining risks.
 """
+
+MULTIBYTE_MARKDOWN = (
+    "# Zápis z porady\n\n"
+    "Petr Šimeček <petr@keboola.com> podepsal smlouvu s firmou Čerpadla Plzeň "
+    "s.r.o. 東京の田中さんも参加しました 🎉 a všichni souhlasili.\n"
+)
 
 SAMPLE_HTML = (
     "<html><body><h1>Acme Report</h1>"
@@ -89,9 +105,24 @@ class FakeAnthropicClient:
         self.error_texts: set[str] = set()
         self.raw_by_substring: dict[str, str] = {}
         self.calls: list[dict] = []
+        # Answers are instant unless a test asks for jitter, which is how the
+        # completion order is made to differ from the submission order.
+        self.delay_seconds = 0.0
+        self.retrieved: list[str] = []
+        self.model_error: Exception | None = None
         self.messages = SimpleNamespace(create=self._create)
+        self.models = SimpleNamespace(retrieve=self._retrieve)
+
+    def _retrieve(self, model: str) -> SimpleNamespace:
+        self.retrieved.append(model)
+        if self.model_error is not None:
+            raise self.model_error
+        return SimpleNamespace(id=model)
 
     def _create(self, **params) -> SimpleNamespace:
+        if self.delay_seconds:
+            time.sleep(random.uniform(0, self.delay_seconds))
+        # list.append is atomic, so several workers may record here at once.
         self.calls.append(params)
         text = params["messages"][0]["content"]
 
@@ -186,6 +217,33 @@ class FakeGenerator:
         return fragments
 
 
+class FakeHTTPClient:
+    """Stand-in for `httpx.Client` covering the one GET the preflight makes."""
+
+    def __init__(self) -> None:
+        self.response: SimpleNamespace | None = None
+        self.error: Exception | None = None
+        self.requested: list[str] = []
+        self.closed = False
+
+    def serve(self, model_ids: list[str], status_code: int = 200) -> None:
+        """Answer as an OpenAI-compatible server offering `model_ids`."""
+        self.error = None
+        self.response = SimpleNamespace(
+            status_code=status_code,
+            json=lambda: {"data": [{"id": model_id} for model_id in model_ids]},
+        )
+
+    def get(self, url: str) -> SimpleNamespace:
+        self.requested.append(url)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _build_canary(person: str, place: str) -> SyntheticFragment:
     fact = CANARY_FACT_TEMPLATE.format(person=person, place=place)
     return SyntheticFragment(
@@ -218,6 +276,7 @@ class Harness:
 
     client: TestClient
     provider: FakeAnthropicClient
+    http: FakeHTTPClient
     db_path: Path
     settings_path: Path
     fragments: list[SyntheticFragment] = field(default_factory=list)
@@ -260,10 +319,17 @@ def harness(tmp_path, monkeypatch) -> Harness:
         server, "get_generator", lambda config, store: FakeGenerator(store, created)
     )
 
+    # The preflight's only network call is stubbed out too: by default the
+    # local endpoint answers and serves exactly the configured model.
+    http = FakeHTTPClient()
+    http.serve([config.synthetic.llm.model])
+    monkeypatch.setattr(server, "get_http_client", lambda: http)
+
     with TestClient(server.app) as client:
         yield Harness(
             client=client,
             provider=provider,
+            http=http,
             db_path=db_path,
             settings_path=settings_path,
             fragments=created,
@@ -296,10 +362,39 @@ def arm_provider(harness: Harness, document: dict) -> dict[str, list[tuple[str, 
     return mapping
 
 
-def detect(harness: Harness, doc_id: str) -> dict:
+def with_concurrency(config, workers: int):
+    """Return `config` with the detection concurrency set to `workers`."""
+    return replace(config, anthropic=replace(config.anthropic, detect_concurrency=workers))
+
+
+def set_concurrency(monkeypatch, workers: int) -> None:
+    """Make the app run its detection requests `workers` at a time.
+
+    Called from inside a test, so it patches the config the `harness` fixture
+    already installed.
+    """
+    config = with_concurrency(server.get_config(), workers)
+    monkeypatch.setattr(server, "get_config", lambda: config)
+
+
+def detect_events(harness: Harness, doc_id: str) -> list[dict]:
+    """Run a detection and return its progress stream, one event per line."""
     response = harness.client.post("/api/detect", json={"doc_id": doc_id})
     assert response.status_code == 200, response.text
-    return response.json()
+    assert response.headers["content-type"].startswith(NDJSON_MEDIA_TYPE)
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+def detect(harness: Harness, doc_id: str) -> dict:
+    """Run a detection and return the final `done` event.
+
+    The `done` event repeats the whole run, so a test that is not about the
+    streaming itself reads it exactly as it read the old JSON body.
+    """
+    events = detect_events(harness, doc_id)
+    assert events, "the stream carried no events"
+    assert events[-1]["type"] == "done", events[-1]
+    return events[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +413,7 @@ def test_get_settings_masks_the_key_and_reports_config_defaults(harness):
     assert payload["effort"] == config.anthropic.effort
     assert payload["llm_base_url"] == config.synthetic.llm.base_url
     assert payload["llm_model"] == config.synthetic.llm.model
+    assert payload["llm_enabled"] == config.synthetic.llm.enabled
     assert payload["chunk_size_tokens"] == config.chunking.chunk_size_tokens
     assert payload["chaff_ratio"] == config.synthetic.chaff_ratio
     assert payload["honeytoken_rate"] == config.synthetic.honeytoken_rate
@@ -348,6 +444,25 @@ def test_settings_roundtrip_persists_overrides(harness):
     stored = json.loads(harness.settings_path.read_text(encoding="utf-8"))
     assert stored["model"] == "claude-test-model"
     assert stored["anthropic_api_key"] == DUMMY_API_KEY
+
+
+def test_llm_enabled_survives_being_switched_off_and_on(harness):
+    """False is a stored decision, not an absent setting."""
+    assert harness.client.get("/api/settings").json()["llm_enabled"] is True
+
+    payload = harness.client.put("/api/settings", json={"llm_enabled": False}).json()
+
+    assert payload["llm_enabled"] is False
+    assert harness.client.get("/api/settings").json()["llm_enabled"] is False
+    stored = json.loads(harness.settings_path.read_text(encoding="utf-8"))
+    assert stored["llm_enabled"] is False
+    # The untouched key is still there: one field may be sent on its own.
+    assert stored["anthropic_api_key"] == DUMMY_API_KEY
+
+    payload = harness.client.put("/api/settings", json={"llm_enabled": True}).json()
+
+    assert payload["llm_enabled"] is True
+    assert harness.client.get("/api/settings").json()["llm_enabled"] is True
 
 
 def test_settings_never_echo_the_raw_key(harness):
@@ -388,7 +503,9 @@ def test_upload_markdown_returns_chunks_whose_tokens_join_to_their_text(harness)
     chunk_size = load_config().chunking.chunk_size_tokens
     for chunk in document["chunks"]:
         assert "".join(chunk["tokens"]) == chunk["text"]
-        assert chunk["token_count"] == len(chunk["tokens"])
+        # A display segment is one token unless a character spans several, so
+        # the count is the real token count and never below the segments.
+        assert chunk["token_count"] >= len(chunk["tokens"])
         assert chunk["extended"] == (chunk["token_count"] > chunk_size)
 
     # Reassembling the chunks reproduces the document byte for byte.
@@ -396,6 +513,28 @@ def test_upload_markdown_returns_chunks_whose_tokens_join_to_their_text(harness)
     assert [chunk["seq"] for chunk in document["chunks"]] == list(
         range(len(document["chunks"]))
     )
+
+
+def test_upload_shows_multibyte_characters_whole(harness):
+    """A name whose letters span two tokens must not be shown as U+FFFD.
+
+    This is the difference between decoding each token on its own and decoding
+    the token bytes as they accumulate: "Šimeček" costs several tokens per
+    accented letter, and the per-token rendering turns each of them into a
+    replacement character.
+    """
+    document = upload_markdown(harness, name="cz.md", text=MULTIBYTE_MARKDOWN)
+
+    assert document["markdown"] == MULTIBYTE_MARKDOWN
+    for chunk in document["chunks"]:
+        assert "".join(chunk["tokens"]) == chunk["text"]
+        assert "�" not in "".join(chunk["tokens"])
+    assert "".join(chunk["text"] for chunk in document["chunks"]) == MULTIBYTE_MARKDOWN
+    # The name really did travel through the payload intact.
+    rendered = "".join(
+        segment for chunk in document["chunks"] for segment in chunk["tokens"]
+    )
+    assert "Petr Šimeček <petr@keboola.com>" in rendered
 
 
 def test_upload_html_is_converted_to_markdown(harness):
@@ -481,10 +620,12 @@ def test_detect_mixes_shuffles_and_routes_results(harness):
     fragment_ids = {fragment.fragment_id for fragment in harness.fragments}
     submitted = {item["custom_id"] for item in result["requests"]}
     assert submitted == chunk_ids | fragment_ids
-    # Results are reported in the submission order.
-    assert [item["custom_id"] for item in result["results"]] == [
+    # Every request is answered exactly once. The requests run several at a
+    # time, so the answers arrive in completion order rather than in submission
+    # order; that ordering is pinned in the concurrency tests below.
+    assert Counter(item["custom_id"] for item in result["results"]) == Counter(
         item["custom_id"] for item in result["requests"]
-    ]
+    )
 
     # Only real requests carry a sequence number; synthetic ones must not.
     for item in result["requests"]:
@@ -636,6 +777,248 @@ def test_detect_reports_refusals_and_errors_per_request(harness):
     )
 
 
+def test_detect_streams_its_progress_in_order(harness):
+    """The stream tells the story of the run, step by step."""
+    document = upload_markdown(harness)
+    arm_provider(harness, document)
+    config = load_config()
+
+    events = detect_events(harness, document["doc_id"])
+
+    types = [event["type"] for event in events]
+    assert types[0] == "phase"
+    assert types.count("submitted") == 1
+    assert types.count("done") == 1
+    assert types[-1] == "done"
+    assert "error" not in types
+
+    # --- phases come first, then the fragments they generate, then the
+    # submission, then one result per request ---
+    submitted_at = types.index("submitted")
+    done_at = types.index("done")
+    first_synthetic = types.index("synthetic")
+    assert types.index("phase") < first_synthetic < submitted_at
+    assert all(index < submitted_at for index, kind in enumerate(types) if kind == "synthetic")
+    assert all(
+        submitted_at < index < done_at
+        for index, kind in enumerate(types)
+        if kind == "result"
+    )
+
+    phases = [event for event in events if event["type"] == "phase"]
+    assert [phase["phase"] for phase in phases] == [
+        "planning",
+        "synthetics",
+        "canaries",
+    ]
+    assert phases[0]["detail"] == f"{len(document['chunks'])} real fragments"
+    assert config.synthetic.llm.model in phases[1]["detail"]
+    assert config.synthetic.llm.base_url in phases[1]["detail"]
+    assert phases[2]["detail"] == "ensuring canary set"
+
+    # --- one synthetic event per generated fragment, counted as it goes ---
+    done = events[-1]
+    synthetic_events = [event for event in events if event["type"] == "synthetic"]
+    by_kind = Counter(event["kind"] for event in synthetic_events)
+    assert by_kind == Counter(
+        {
+            kind: count
+            for kind, count in done["composition"].items()
+            if kind != "real" and count
+        }
+    )
+    for kind, count in by_kind.items():
+        indexes = [event["index"] for event in synthetic_events if event["kind"] == kind]
+        assert indexes == list(range(1, count + 1))
+        assert all(
+            event["total"] == count
+            for event in synthetic_events
+            if event["kind"] == kind
+        )
+    assert {event["fragment_id"] for event in synthetic_events} == {
+        fragment.fragment_id for fragment in harness.fragments
+    }
+
+    # --- the submission is announced whole, before any answer arrives ---
+    submitted = events[submitted_at]
+    assert submitted["batch_id"] == done["batch_id"]
+    assert submitted["composition"] == done["composition"]
+    assert submitted["payload_template"] == done["payload_template"]
+    assert submitted["requests"] == done["requests"]
+
+    # --- one result event per request, in submission order ---
+    results = [event for event in events if event["type"] == "result"]
+    assert len(results) == len(done["requests"])
+    assert [result["index"] for result in results] == list(
+        range(1, len(results) + 1)
+    )
+    assert all(result["total"] == len(results) for result in results)
+    assert Counter(result["custom_id"] for result in results) == Counter(
+        item["custom_id"] for item in done["requests"]
+    )
+    for result, recorded in zip(results, done["results"]):
+        assert {key: result[key] for key in recorded} == recorded
+
+
+def test_detect_events_are_produced_one_at_a_time(harness):
+    """Progress that only arrives at the end is not progress.
+
+    Asserted on the generator behind the endpoint rather than through the test
+    client, which buffers a streamed answer no matter how the server produced
+    it. What matters here is that each event exists before the work that
+    follows it has been done.
+    """
+    document = upload_markdown(harness)
+    arm_provider(harness, document)
+
+    store = harness.store()
+    try:
+        chunks = store.get_document_chunks(document["doc_id"])
+        stream = server._detect_events(
+            # One worker, so "one more event" means exactly one more call.
+            with_concurrency(server.get_config(), 1),
+            store,
+            harness.provider,
+            FakeGenerator(store, []),
+            chunks,
+        )
+        try:
+            events = []
+            for line in stream:
+                events.append(json.loads(line))
+                if events[-1]["type"] == "submitted":
+                    break
+
+            # The submission was announced before a single fragment left.
+            assert events[-1]["type"] == "submitted"
+            assert harness.provider.calls == []
+
+            # Pulling one more event costs exactly one provider call.
+            assert json.loads(next(stream))["type"] == "result"
+            assert len(harness.provider.calls) == 1
+        finally:
+            stream.close()
+    finally:
+        store.close()
+
+
+def test_detect_reports_a_mid_stream_failure_as_the_last_event(harness, monkeypatch):
+    """Once the status line is sent, a break can only be reported in-band."""
+    document = upload_markdown(harness)
+    arm_provider(harness, document)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("store went away")
+
+    monkeypatch.setattr(ChunkStore, "record_batch", explode)
+
+    events = detect_events(harness, document["doc_id"])
+
+    assert events[-1] == {"type": "error", "detail": "store went away"}
+    # The events produced before the break are still there, and no run was
+    # ever reported as finished.
+    assert events[0]["type"] == "phase"
+    assert not any(event["type"] in {"submitted", "done"} for event in events)
+    # Nothing was submitted, so the provider was never called.
+    assert harness.provider.calls == []
+
+
+def test_detect_streams_multibyte_fragments_unharmed(harness):
+    """The stream carries the fragment texts; UTF-8 must survive the encoding."""
+    document = upload_markdown(harness, name="cz.md", text=MULTIBYTE_MARKDOWN)
+
+    events = detect_events(harness, document["doc_id"])
+
+    done = events[-1]
+    real = [item for item in done["requests"] if item["kind"] == "real"]
+    assert "".join(
+        item["text"] for item in sorted(real, key=lambda item: item["seq"])
+    ) == MULTIBYTE_MARKDOWN
+    assert "Petr Šimeček" in "".join(item["text"] for item in real)
+
+
+@pytest.mark.parametrize("workers", [1, 0, -4], ids=["one", "zero", "negative"])
+def test_detect_with_a_single_worker_answers_in_submission_order(
+    harness, monkeypatch, workers
+):
+    """One worker is the old sequential run; a nonsensical count becomes one."""
+    set_concurrency(monkeypatch, workers)
+    document = upload_markdown(harness)
+    expected = arm_provider(harness, document)
+
+    result = detect(harness, document["doc_id"])
+
+    assert [item["custom_id"] for item in result["results"]] == [
+        item["custom_id"] for item in result["requests"]
+    ]
+    assert [call["messages"][0]["content"] for call in harness.provider.calls] == [
+        item["text"] for item in result["requests"]
+    ]
+    assert result["entities_stored"] == sum(len(names) for names in expected.values())
+    assert all(item["status"] == "ok" for item in result["results"])
+
+
+def test_detect_in_parallel_answers_every_fragment_and_routes_it(harness, monkeypatch):
+    """Six in flight, answers arriving out of order, same bookkeeping."""
+    set_concurrency(monkeypatch, 6)
+    document = upload_markdown(harness)
+    expected = arm_provider(harness, document)
+    # Tiny, uneven delays: the completion order stops mirroring the submission
+    # order, which is what the routing must survive.
+    harness.provider.delay_seconds = 0.01
+
+    events = detect_events(harness, document["doc_id"])
+    done = events[-1]
+
+    assert done["type"] == "done"
+    total = sum(done["composition"].values())
+    assert len(done["requests"]) == total
+    assert len(done["results"]) == total
+    assert len(harness.provider.calls) == total
+
+    # --- one result event per fragment, no repeats, no losses ---
+    result_events = [event for event in events if event["type"] == "result"]
+    assert len(result_events) == total
+    assert [event["index"] for event in result_events] == list(range(1, total + 1))
+    assert all(event["total"] == total for event in result_events)
+    assert Counter(event["custom_id"] for event in result_events) == Counter(
+        item["custom_id"] for item in done["requests"]
+    )
+    assert all(event["status"] == "ok" for event in result_events)
+
+    # --- storage routing is unchanged by the concurrency ---
+    assert done["entities_stored"] == sum(len(names) for names in expected.values())
+    honeytokens = harness.synthetic(KIND_HONEYTOKEN)
+    assert done["honeytoken_recall"] == {
+        "planted": len(honeytokens) * len(HONEYTOKEN_PLANTED),
+        "found": len(honeytokens) * len(HONEYTOKEN_REPORTED),
+        "recall": len(HONEYTOKEN_REPORTED) / len(HONEYTOKEN_PLANTED),
+    }
+
+    store = harness.store()
+    try:
+        stored = store.get_document_entities(document["doc_id"])
+        assert set(stored) == {pair for names in expected.values() for pair in names}
+        for name, _ in HONEYTOKEN_PLANTED:
+            assert all(name != text for text, _ in stored)
+        assert [batch["status"] for batch in store.list_batches()] == ["sync-completed"]
+    finally:
+        store.close()
+
+
+def test_detect_names_the_templates_when_the_local_llm_is_off(harness):
+    harness.client.put("/api/settings", json={"llm_enabled": False})
+    document = upload_markdown(harness)
+    arm_provider(harness, document)
+
+    events = detect_events(harness, document["doc_id"])
+
+    phases = [event for event in events if event["type"] == "phase"]
+    assert phases[1]["phase"] == "synthetics"
+    assert phases[1]["detail"] == PHASE_SYNTHETICS_TEMPLATE_DETAIL
+    assert events[-1]["type"] == "done"
+
+
 def test_detect_without_an_api_key_changes_nothing(harness):
     document = upload_markdown(harness)
     harness.client.put("/api/settings", json={"anthropic_api_key": ""})
@@ -723,6 +1106,165 @@ def test_report_counts_fragments_and_recall_after_a_run(harness):
     assert payload["honeytoken_stats"][0]["recall"] == pytest.approx(
         result["honeytoken_recall"]["recall"]
     )
+
+
+# ---------------------------------------------------------------------------
+# preflight
+# ---------------------------------------------------------------------------
+
+
+def verify(harness: Harness) -> dict[str, dict]:
+    """Run the preflight and return its checks keyed by name."""
+    response = harness.client.post("/api/verify")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    checks = {check["name"]: check for check in payload["checks"]}
+    assert set(checks) == {"anthropic", "local_llm", "markitdown", "database"}
+    for check in payload["checks"]:
+        assert check["label"]
+        assert isinstance(check["ok"], bool)
+        assert check["detail"]
+        assert check["latency_ms"] >= 0
+    assert payload["all_ok"] == all(check["ok"] for check in payload["checks"])
+    return {**checks, "all_ok": payload["all_ok"]}
+
+
+def test_verify_passes_when_the_whole_environment_is_there(harness):
+    config = load_config()
+
+    checks = verify(harness)
+
+    assert checks["all_ok"] is True
+    assert checks["anthropic"]["ok"] is True
+    assert config.anthropic.model in checks["anthropic"]["detail"]
+    assert harness.provider.retrieved == [config.anthropic.model]
+    assert checks["local_llm"]["ok"] is True
+    assert harness.http.requested == [f"{config.synthetic.llm.base_url}/models"]
+    assert harness.http.closed is True
+    assert checks["markitdown"]["ok"] is True
+    assert checks["database"]["ok"] is True
+    assert str(harness.db_path) in checks["database"]["detail"]
+
+
+def test_verify_without_an_api_key_points_at_the_settings(harness):
+    harness.client.put("/api/settings", json={"anthropic_api_key": ""})
+
+    checks = verify(harness)
+
+    assert checks["anthropic"]["ok"] is False
+    assert checks["anthropic"]["detail"] == VERIFY_NO_KEY_DETAIL
+    assert checks["all_ok"] is False
+    # A key that is not there is never sent anywhere.
+    assert harness.provider.retrieved == []
+    # The other checks are independent and still ran.
+    assert checks["local_llm"]["ok"] is True
+    assert checks["database"]["ok"] is True
+
+
+def test_verify_surfaces_the_api_error_behind_a_bad_key(harness):
+    harness.provider.model_error = anthropic.APIError(
+        "invalid x-api-key", httpx.Request("GET", "http://test"), body=None
+    )
+
+    checks = verify(harness)
+
+    assert checks["anthropic"]["ok"] is False
+    assert "invalid x-api-key" in checks["anthropic"]["detail"]
+    assert checks["all_ok"] is False
+
+
+def test_verify_reports_an_unreachable_local_llm_with_a_hint(harness):
+    config = load_config()
+    harness.http.error = httpx.ConnectError("connection refused")
+
+    checks = verify(harness)
+
+    assert checks["local_llm"]["ok"] is False
+    assert f"ollama pull {config.synthetic.llm.model}" in checks["local_llm"]["detail"]
+    assert checks["all_ok"] is False
+    # The endpoint failing says nothing about the rest of the environment.
+    assert checks["anthropic"]["ok"] is True
+    assert checks["markitdown"]["ok"] is True
+
+
+def test_verify_lists_what_the_local_llm_serves_instead(harness):
+    config = load_config()
+    harness.http.serve(["other-model", "yet-another"])
+
+    checks = verify(harness)
+
+    assert checks["local_llm"]["ok"] is False
+    assert config.synthetic.llm.model in checks["local_llm"]["detail"]
+    assert "other-model, yet-another" in checks["local_llm"]["detail"]
+
+
+def test_verify_accepts_the_implicit_ollama_latest_tag(harness):
+    config = load_config()
+    harness.http.serve([f"{config.synthetic.llm.model}:latest"])
+
+    checks = verify(harness)
+
+    assert checks["local_llm"]["ok"] is True
+
+
+def test_verify_reports_a_local_llm_that_answers_with_an_error(harness):
+    harness.http.serve([], status_code=503)
+
+    checks = verify(harness)
+
+    assert checks["local_llm"]["ok"] is False
+    assert "503" in checks["local_llm"]["detail"]
+
+
+def test_verify_skips_the_local_llm_when_it_is_switched_off(harness):
+    harness.client.put("/api/settings", json={"llm_enabled": False})
+
+    checks = verify(harness)
+
+    assert checks["local_llm"]["ok"] is True
+    assert checks["local_llm"]["detail"] == VERIFY_LLM_DISABLED_DETAIL
+    # A component deliberately not in use is never probed and never fails.
+    assert harness.http.requested == []
+    assert checks["all_ok"] is True
+
+
+def test_verify_reports_a_broken_converter(harness, monkeypatch):
+    def broken() -> None:
+        raise RuntimeError("markitdown is not installed")
+
+    monkeypatch.setattr(server, "get_markitdown", broken)
+
+    checks = verify(harness)
+
+    assert checks["markitdown"]["ok"] is False
+    assert "markitdown is not installed" in checks["markitdown"]["detail"]
+    assert checks["all_ok"] is False
+
+
+def test_verify_reports_a_converter_that_returns_nothing(harness, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_markitdown",
+        lambda: SimpleNamespace(convert=lambda source: SimpleNamespace(markdown="  ")),
+    )
+
+    checks = verify(harness)
+
+    assert checks["markitdown"]["ok"] is False
+    assert checks["all_ok"] is False
+
+
+def test_verify_reports_an_unusable_database(harness, monkeypatch):
+    def unusable(config) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(server, "get_store", unusable)
+
+    checks = verify(harness)
+
+    assert checks["database"]["ok"] is False
+    assert "unable to open database file" in checks["database"]["detail"]
+    assert checks["all_ok"] is False
 
 
 # ---------------------------------------------------------------------------

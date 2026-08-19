@@ -480,6 +480,9 @@ class SyntheticGenerator:
     def _write_text(self, prompt: str, required: list[str], fallback: str) -> str:
         """Ask the LLM for prose, validate it, and fall back on a template.
 
+        With the local LLM disabled in config, the deterministic template is
+        used directly - instant, no local inference server needed.
+
         The LLM is retried with a fresh seed while its answer fails validation.
         A model too sloppy to follow the instruction must not stall the
         pipeline, so the deterministic `fallback` is used after the last try.
@@ -488,6 +491,8 @@ class SyntheticGenerator:
             LocalLLMError: when the endpoint itself is unusable; that is an
                 operator problem worth surfacing, not a sloppy answer.
         """
+        if not self._config.synthetic.llm.enabled:
+            return fallback
         llm = self._get_llm()
         for attempt in range(1, LLM_ATTEMPTS + 1):
             candidate = llm.generate(prompt, self._next_seed()).strip()

@@ -141,6 +141,83 @@ def test_text_shorter_than_chunk_size_yields_single_chunk(chunker: Chunker) -> N
 
 
 # ----------------------------------------------------------------------
+# display segments
+# ----------------------------------------------------------------------
+
+# The accented letters cost several tokens each, so decoding those tokens one
+# by one is exactly what produces "Petr ??imecek" in a token view.
+CZECH_NAME_TEXT = "Petr Šimeček <petr@keboola.com>"
+EMOJI_TEXT = "Ship it 🚀🎉 today 👨‍👩‍👧‍👦"
+CJK_TEXT = "東京の田中さんは新しい契約に署名しました。"
+
+DISPLAY_TEXTS = {
+    "czech_name": CZECH_NAME_TEXT,
+    "emoji": EMOJI_TEXT,
+    "cjk": CJK_TEXT,
+    "english_markdown": ENGLISH_MARKDOWN,
+    "czech_paragraph": CZECH_TEXT,
+    "emoji_and_cjk": EMOJI_CJK_TEXT,
+    "shorter_than_chunk": SHORT_TEXT,
+    "empty": "",
+}
+
+REPLACEMENT_CHARACTER = "�"
+
+
+@pytest.mark.parametrize("name", sorted(DISPLAY_TEXTS))
+def test_display_segments_join_back_to_the_text(chunker: Chunker, name: str) -> None:
+    """The token view is lossless, which the per-token view cannot be."""
+    text = DISPLAY_TEXTS[name]
+    assert "".join(chunker.token_display_segments(text)) == text
+
+
+@pytest.mark.parametrize("name", sorted(DISPLAY_TEXTS))
+def test_display_segments_invent_no_replacement_characters(
+    chunker: Chunker, name: str
+) -> None:
+    text = DISPLAY_TEXTS[name]
+    assert REPLACEMENT_CHARACTER not in text, "the sample must be clean to begin with"
+    for segment in chunker.token_display_segments(text):
+        assert REPLACEMENT_CHARACTER not in segment
+
+
+def test_display_segments_merge_only_the_split_characters(chunker: Chunker) -> None:
+    """Most segments are one token; only a split character forces a merge."""
+    segments = chunker.token_display_segments(CZECH_NAME_TEXT)
+    tokens = chunker.token_strings(CZECH_NAME_TEXT)
+
+    # A merge happened at all - otherwise this text would not be testing much.
+    assert len(segments) < len(tokens)
+    # ...but only where it had to: the ASCII half is untouched.
+    assert "Petr" in "".join(segments[:2])
+    assert any(REPLACEMENT_CHARACTER in token for token in tokens)
+    assert "Šimeček" in "".join(segments)
+
+
+def test_display_segments_keep_a_replacement_character_the_text_carries(
+    chunker: Chunker,
+) -> None:
+    """A U+FFFD that was written stays; the guarantee is about inventing one."""
+    text = f"A {REPLACEMENT_CHARACTER} was typed here."
+    segments = chunker.token_display_segments(text)
+
+    assert "".join(segments) == text
+    assert REPLACEMENT_CHARACTER in "".join(segments)
+
+
+def test_display_segments_of_empty_text_are_empty(chunker: Chunker) -> None:
+    assert chunker.token_display_segments("") == []
+
+
+@pytest.mark.parametrize("name", sorted(DISPLAY_TEXTS))
+def test_display_segments_never_outnumber_the_tokens(
+    chunker: Chunker, name: str
+) -> None:
+    text = DISPLAY_TEXTS[name]
+    assert len(chunker.token_display_segments(text)) <= len(chunker.token_strings(text))
+
+
+# ----------------------------------------------------------------------
 # chunk sizes
 # ----------------------------------------------------------------------
 
