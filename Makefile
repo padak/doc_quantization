@@ -1,4 +1,9 @@
-.PHONY: run start stop restart status logs test
+.PHONY: help run start stop restart status logs test
+
+# Bare `make` shows the target list rather than silently running `run` (the
+# first target otherwise wins by default), which is what someone typing
+# `make` with no arguments actually wants to see first.
+.DEFAULT_GOAL := help
 
 VENV := .venv
 UVICORN := $(VENV)/bin/uvicorn
@@ -27,10 +32,20 @@ CHECK_RUNNING = pid=$$(cat $(PID_FILE) 2>/dev/null); \
 		running=0; \
 	fi
 
+# PID of whatever is listening on $(PORT), regardless of whether `make start`
+# put it there. Without this, `status`/`stop` only ever look at $(PID_FILE)
+# and will report "Not running" while a server started some other way (a
+# manual uvicorn invocation, an IDE launch config) is answering right there on
+# the port - which is confusing and, for `stop`, would leave someone thinking
+# they freed the port when they didn't.
+PORT_HOLDER = if command -v lsof >/dev/null 2>&1; then \
+		lsof -tiTCP:$(PORT) -sTCP:LISTEN 2>/dev/null | head -n1; \
+	fi
+
 # Runs in the foreground; Ctrl-C stops it. This is what README.md already
 # documents, kept here so `make run` and `make start` share one venv check
 # instead of drifting apart.
-run:
+run: ## Run the server in the foreground (Ctrl-C to stop)
 	@test -x $(UVICORN) || { echo $(VENV_HINT); exit 1; }
 	$(UVICORN) webapp.server:app --port $(PORT)
 
@@ -42,7 +57,7 @@ run:
 # lag the open port by many seconds. A port already served by someone else is
 # refused up front - otherwise that same probe would answer for the foreign
 # server and report a success our own (bind-failed) process never achieved.
-start:
+start: ## Start the server in the background
 	@test -x $(UVICORN) || { echo $(VENV_HINT); exit 1; }
 	@$(CHECK_RUNNING); \
 	if [ $$running -eq 1 ]; then \
@@ -85,11 +100,19 @@ start:
 
 # Waits for the process to actually exit rather than just signalling it, so a
 # following `make start` cannot race the old server for the port or the log.
-stop:
+# Only ever kills the PID this Makefile itself launched (see CHECK_RUNNING) -
+# a process holding $(PORT) that we didn't start is reported, not touched,
+# since we have no way to know it's safe to kill.
+stop: ## Stop the server started by 'make start'
 	@$(CHECK_RUNNING); \
 	if [ $$running -eq 0 ]; then \
-		echo "Not running"; \
+		holder=$$($(PORT_HOLDER)); \
 		rm -f $(PID_FILE); \
+		if [ -n "$$holder" ]; then \
+			echo "Not running via 'make start', but port $(PORT) is held by PID $$holder (started some other way) - leaving it alone."; \
+			exit 1; \
+		fi; \
+		echo "Not running"; \
 		exit 0; \
 	fi; \
 	kill $$pid; \
@@ -108,25 +131,37 @@ stop:
 
 # Sub-makes rather than prerequisites, so stop always completes before start
 # even under `make -j`.
-restart:
+restart: ## Stop then start the server
 	@$(MAKE) stop
 	@$(MAKE) start
 
-status:
+status: ## Show whether the server is running
 	@$(CHECK_RUNNING); \
 	if [ $$running -eq 1 ]; then \
 		echo "Running on http://127.0.0.1:$(PORT) (PID $$pid)"; \
+		exit 0; \
+	fi; \
+	holder=$$($(PORT_HOLDER)); \
+	if [ -n "$$holder" ]; then \
+		echo "Not running via 'make start', but port $(PORT) is held by PID $$holder (started some other way)."; \
 	else \
 		echo "Not running"; \
 	fi
 
-logs:
+logs: ## Follow the server's log output
 	@if [ -f $(LOG_FILE) ]; then \
 		tail -f $(LOG_FILE); \
 	else \
 		echo "No log file yet - start the server with 'make start' first"; \
 	fi
 
-test:
+test: ## Run the test suite
 	@test -x $(VENV)/bin/pytest || { echo $(VENV_HINT); exit 1; }
 	$(VENV)/bin/pytest -q
+
+help: ## Show this help
+	@echo "Targets:"
+	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | \
+		awk 'BEGIN {FS = ":.*## "}; {printf "  %-10s %s\n", $$1, $$2}'
+	@echo ""
+	@echo "PORT defaults to $(PORT); override with e.g. 'make start PORT=8811'."
