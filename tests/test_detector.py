@@ -10,7 +10,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from doc_quant.detector import DETECTION_SYSTEM_PROMPT, ENTITY_SCHEMA, Detector
+from doc_quant.detector import (
+    DETECTION_SYSTEM_PROMPT,
+    ENTITY_SCHEMA,
+    Detector,
+    parse_entities,
+    parse_entities_payload,
+)
 
 MODEL = "claude-opus-5"
 EFFORT = "low"
@@ -373,3 +379,93 @@ def test_fetch_mixed_results_are_counted_independently():
     assert counts == expected_counts(succeeded=1, errored=2, refused=1, entities=1)
     assert store.entities == {"chunk-a": [("Jan", "person")]}
     assert client.batches.results_calls == ["msgbatch_test"]
+
+
+# --- payload-level parsing -------------------------------------------------
+#
+# parse_entities_payload is what every transport shares: the Anthropic paths
+# hand it the decoded text block, a local model path the decoded chat
+# completion. These tests pin the rules at that level, so a new transport can
+# be trusted to read an answer exactly like the batch path does.
+
+
+def test_parse_entities_payload_accepts_valid_dict():
+    payload = {"entities": [{"text": "Jan Novak", "type": "person"}]}
+    assert parse_entities_payload(payload) == [("Jan Novak", "person")]
+
+
+def test_parse_entities_payload_accepts_empty_entity_list():
+    assert parse_entities_payload({"entities": []}) == []
+
+
+def test_parse_entities_payload_preserves_order_and_both_types():
+    payload = {
+        "entities": [
+            {"text": "Jan Novak", "type": "person"},
+            {"text": "Meridian s.r.o.", "type": "company"},
+        ]
+    }
+    assert parse_entities_payload(payload) == [
+        ("Jan Novak", "person"),
+        ("Meridian s.r.o.", "company"),
+    ]
+
+
+def test_parse_entities_payload_rejects_non_dict():
+    with pytest.raises(TypeError):
+        parse_entities_payload(["not", "a", "dict"])
+
+
+def test_parse_entities_payload_rejects_missing_entities_key():
+    with pytest.raises(KeyError):
+        parse_entities_payload({"wrong_key": []})
+
+
+def test_parse_entities_payload_rejects_non_list_entities():
+    with pytest.raises(TypeError):
+        parse_entities_payload({"entities": "not-a-list"})
+
+
+def test_parse_entities_payload_rejects_non_object_entity():
+    with pytest.raises(TypeError):
+        parse_entities_payload({"entities": ["Jan Novak"]})
+
+
+def test_parse_entities_payload_rejects_non_string_text():
+    with pytest.raises(TypeError):
+        parse_entities_payload({"entities": [{"text": 42, "type": "person"}]})
+
+
+def test_parse_entities_payload_rejects_entity_without_type():
+    with pytest.raises(KeyError):
+        parse_entities_payload({"entities": [{"text": "Jan Novak"}]})
+
+
+def test_parse_entities_payload_rejects_unknown_type():
+    with pytest.raises(ValueError):
+        parse_entities_payload({"entities": [{"text": "x", "type": "place"}]})
+
+
+def test_parse_entities_reads_the_text_block_and_delegates():
+    result = succeeded_result("chunk-a", entity_payload(("Jan Novak", "person")))
+
+    assert parse_entities(result.result.message) == [("Jan Novak", "person")]
+
+
+def test_parse_entities_skips_non_text_blocks():
+    message = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[
+            SimpleNamespace(type="thinking", thinking="hmm"),
+            SimpleNamespace(type="text", text=entity_payload(("Jan Novak", "person"))),
+        ],
+    )
+
+    assert parse_entities(message) == [("Jan Novak", "person")]
+
+
+def test_parse_entities_rejects_a_message_without_a_text_block():
+    message = SimpleNamespace(stop_reason="end_turn", content=[])
+
+    with pytest.raises(ValueError):
+        parse_entities(message)
