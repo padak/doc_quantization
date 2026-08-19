@@ -2295,8 +2295,7 @@
       'and canaries — ride along with the real chunks in every batch. Clear a field to fall back to the ' +
       'config-file default.</p>';
     html += '<div class="form-grid">';
-    html += pipelineNumberFieldsHtml(settings);
-    html += pipelineSwitchesHtml(settings);
+    html += pipelineParamsHtml(settings);
     html += '</div>';
 
     html += '<div class="btn-row">';
@@ -2312,66 +2311,98 @@
     wireSettings(root);
   }
 
-  // The four tunable pipeline numbers: each can be overridden or cleared back
-  // to the config-file default (pipeline_defaults from the settings payload).
-  // chaff_ratio and honeytoken_rate carry `percent: true` - they are ratios
-  // in config.json and in the API, but a raw "0.02" reads far less clearly
-  // than "2%", so the input and its hint show and accept a percentage while
-  // ratioToPercent/percentToRatio convert at the edges (see submit handler).
-  const PIPELINE_NUMBER_FIELDS = [
-    { key: 'chunk_size_tokens', min: 1, step: 1 },
-    // step 'any' rather than a fixed grid: the browser rejects a submit whose
-    // number falls between steps, so a grid of e.g. 5 would make 33% (a ratio
-    // of 0.33 that the backend accepts happily) unsaveable - and a config-file
-    // value off the grid would block the whole settings form.
-    { key: 'chaff_ratio', min: 0, step: 'any', percent: true },
-    { key: 'honeytoken_rate', min: 0, step: 'any', percent: true },
-    { key: 'canaries_per_batch', min: 0, step: 1 },
+  // One entry per tunable pipeline parameter, in the order they are rendered.
+  // Each group is a number field plus the switch that turns the very mechanism
+  // that number controls on and off; chunking has no switch because it always
+  // happens, so that group is number-only. Grouping them here (rather than
+  // rendering two flat lists) is what keeps chaff_ratio directly above
+  // chaff_enabled on screen instead of letting grid auto-placement scatter the
+  // pair across unrelated columns.
+  //
+  // number.percent marks a ratio field: chaff_ratio and honeytoken_rate are
+  // ratios in config.json and in the API, but a raw "0.02" reads far less
+  // clearly than "2%", so the input and its hint show and accept a percentage
+  // while ratioToPercent/percentToRatio convert at the edges (see the submit
+  // handler). The switch hint text mirrors the plain-language GLOSSARY entry
+  // for the same concept.
+  const PIPELINE_PARAM_GROUPS = [
+    {
+      number: { key: 'chunk_size_tokens', min: 1, step: 1 },
+      // No switch: chunking is unconditional, there is no chunking_enabled.
+      // The note takes the switch's place so the empty slot reads as a
+      // deliberate "nothing to toggle here" rather than a missing control.
+      toggle: null,
+      note: 'Always on — every document is chunked, so there is no switch for this one.',
+    },
+    {
+      // step 'any' rather than a fixed grid: the browser rejects a submit whose
+      // number falls between steps, so a grid of e.g. 5 would make 33% (a ratio
+      // of 0.33 that the backend accepts happily) unsaveable - and a config-file
+      // value off the grid would block the whole settings form.
+      number: { key: 'chaff_ratio', min: 0, step: 'any', percent: true },
+      toggle: {
+        key: 'chaff_enabled', glossary: 'chaff',
+        hint: 'Chaff adds decoy fragments the provider cannot tell apart from real ones, diluting any copy retained on the other side.',
+      },
+    },
+    {
+      number: { key: 'honeytoken_rate', min: 0, step: 'any', percent: true },
+      toggle: {
+        key: 'honeytokens_enabled', glossary: 'honeytoken',
+        hint: 'Honeytokens are planted fragments with known names, so we can measure how many the detector actually catches (its recall).',
+      },
+    },
+    {
+      number: { key: 'canaries_per_batch', min: 0, step: 1 },
+      toggle: {
+        key: 'canaries_enabled', glossary: 'canary',
+        hint: 'Canaries seed unique fabricated facts into the traffic — a model repeating one back is evidence of training misuse.',
+      },
+    },
   ];
 
-  function pipelineNumberFieldsHtml(settings) {
+  // Flat views over the groups, for the submit handler: it reads and validates
+  // numbers and switches by key and does not care how they are laid out.
+  const PIPELINE_NUMBER_FIELDS = PIPELINE_PARAM_GROUPS.map((g) => g.number);
+  const PIPELINE_SWITCHES = PIPELINE_PARAM_GROUPS.filter((g) => g.toggle).map((g) => g.toggle);
+
+  function pipelineNumberFieldHtml(f, settings) {
     const defaults = settings.pipeline_defaults || {};
-    let html = '';
-    PIPELINE_NUMBER_FIELDS.forEach((f) => {
-      const rawValue = settings[f.key];
-      const rawDefault = defaults[f.key];
-      const value = rawValue != null ? (f.percent ? ratioToPercent(rawValue) : rawValue) : '';
-      const defaultLabel = rawDefault != null
-        ? (f.percent ? fmtPct(rawDefault) : esc(rawDefault))
-        : '—';
-      const label = f.key + (f.percent ? ' (%)' : '');
-      html += '<div class="field"><label for="f-' + f.key + '">' + esc(label) + info(f.key) + '</label>';
-      html += '<input type="number" id="f-' + f.key + '" name="' + f.key + '" min="' + f.min +
-        '" step="' + f.step + '" value="' + esc(value) + '">';
-      html += '<div class="hint">Default ' + defaultLabel +
-        ' — clear the field to fall back to it.</div></div>';
-    });
+    const rawValue = settings[f.key];
+    const rawDefault = defaults[f.key];
+    const value = rawValue != null ? (f.percent ? ratioToPercent(rawValue) : rawValue) : '';
+    const defaultLabel = rawDefault != null
+      ? (f.percent ? fmtPct(rawDefault) : esc(rawDefault))
+      : '—';
+    const label = f.key + (f.percent ? ' (%)' : '');
+    let html = '<div class="field"><label for="f-' + f.key + '">' + esc(label) + info(f.key) + '</label>';
+    html += '<input type="number" id="f-' + f.key + '" name="' + f.key + '" min="' + f.min +
+      '" step="' + f.step + '" value="' + esc(value) + '">';
+    html += '<div class="hint">Default ' + defaultLabel +
+      ' — clear the field to fall back to it.</div></div>';
     return html;
   }
 
-  // The three synthetic mechanisms, each independently switchable. The hint
-  // text mirrors the plain-language GLOSSARY entry for the same concept.
-  const PIPELINE_SWITCHES = [
-    {
-      key: 'honeytokens_enabled', glossary: 'honeytoken',
-      hint: 'Honeytokens are planted fragments with known names, so we can measure how many the detector actually catches (its recall).',
-    },
-    {
-      key: 'chaff_enabled', glossary: 'chaff',
-      hint: 'Chaff adds decoy fragments the provider cannot tell apart from real ones, diluting any copy retained on the other side.',
-    },
-    {
-      key: 'canaries_enabled', glossary: 'canary',
-      hint: 'Canaries seed unique fabricated facts into the traffic — a model repeating one back is evidence of training misuse.',
-    },
-  ];
+  function pipelineSwitchHtml(s, settings) {
+    let html = '<div class="field"><label for="f-' + s.key + '"><input type="checkbox" id="f-' + s.key +
+      '" name="' + s.key + '"' + (settings[s.key] ? ' checked' : '') + '> ' + s.key + info(s.glossary) + '</label>';
+    html += '<div class="hint">' + s.hint + '</div></div>';
+    return html;
+  }
 
-  function pipelineSwitchesHtml(settings) {
+  // Each group becomes one direct child of the .form-grid, so grid
+  // auto-placement can never split a number away from its switch.
+  function pipelineParamsHtml(settings) {
     let html = '';
-    PIPELINE_SWITCHES.forEach((s) => {
-      html += '<div class="field"><label for="f-' + s.key + '"><input type="checkbox" id="f-' + s.key +
-        '" name="' + s.key + '"' + (settings[s.key] ? ' checked' : '') + '> ' + s.key + info(s.glossary) + '</label>';
-      html += '<div class="hint">' + s.hint + '</div></div>';
+    PIPELINE_PARAM_GROUPS.forEach((g) => {
+      html += '<div class="pipeline-param">';
+      html += pipelineNumberFieldHtml(g.number, settings);
+      if (g.toggle) {
+        html += '<div class="pipeline-param-toggle">' + pipelineSwitchHtml(g.toggle, settings) + '</div>';
+      } else if (g.note) {
+        html += '<div class="pipeline-param-toggle is-static">' + esc(g.note) + '</div>';
+      }
+      html += '</div>';
     });
     return html;
   }

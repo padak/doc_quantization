@@ -1457,6 +1457,37 @@ mark.redacted {
 .hint { font-size: 12px; color: var(--ink-3); margin-top: 5px; }
 .hint.small { font-size: 11px; font-style: italic; }
 
+/* ---------------------------------------------------- pipeline parameters */
+
+/* One grid cell per tunable parameter: the number field on top, the switch
+   that turns its mechanism on and off directly beneath it. The wrapper is the
+   grid's direct child so a pair can never be split across columns. */
+.pipeline-param {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+}
+
+/* The switch sits in an inset well — same bordered-box language as .choice —
+   so it reads as attached to the number above without crowding its hint. */
+.pipeline-param-toggle {
+  margin-top: 10px;
+  padding: 9px 11px;
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+
+/* chunk_size_tokens has no mechanism to switch off. A dashed, unfilled well
+   in the switch's place keeps the group's rhythm and says why it is empty. */
+.pipeline-param-toggle.is-static {
+  background: none;
+  border-style: dashed;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
 /* ------------------------------------------- synthetic generator picker */
 
 .choice-grid {
