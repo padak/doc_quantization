@@ -622,6 +622,58 @@ a:hover { color: var(--accent-strong); }
   font-weight: 600;
 }
 
+/* ----------------------------------------------------------- paste text */
+
+.paste-card { margin-top: 14px; }
+
+.paste-title { font-family: var(--font-head); font-weight: 600; font-size: 15px; margin: 0 0 4px; }
+.paste-hint { color: var(--ink-3); font-size: 13px; margin-bottom: 10px; }
+
+.paste-textarea {
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  padding: 10px 12px;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.paste-textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+.paste-actions {
+  display: flex;
+  gap: 9px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.paste-name {
+  flex: 1;
+  min-width: 220px;
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  padding: 8px 11px;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.paste-name:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
 /* ------------------------------------------------------------- doc list */
 
 .doc-list { display: flex; flex-direction: column; gap: 7px; }
