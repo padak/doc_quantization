@@ -95,11 +95,11 @@
     },
     chaff_ratio: {
       title: 'chaff_ratio',
-      body: 'How many chaff fragments are generated per real chunk. A ratio of 1.0 means one decoy for every real fragment, so half of the batch is noise.',
+      body: 'How many chaff fragments are generated per real chunk, as a percentage. 100% means one decoy for every real fragment, so half of the batch is noise; 200% means two decoys per real fragment.',
     },
     honeytoken_rate: {
       title: 'honeytoken_rate',
-      body: 'How often a honeytoken is planted, relative to the number of real chunks. More honeytokens means a more precise recall measurement and slightly more traffic.',
+      body: 'How often a honeytoken is planted, as a percentage of the real chunks. More honeytokens means a more precise recall measurement and slightly more traffic.',
     },
     canaries_per_batch: {
       title: 'canaries_per_batch',
@@ -186,6 +186,25 @@
     const n = Number(fraction);
     if (!Number.isFinite(n)) return '—';
     return (n * 100).toFixed(1) + '%';
+  }
+
+  // chaff_ratio and honeytoken_rate are stored (and sent to the API) as plain
+  // ratios - 1.0, 0.02 - but a raw ratio reads awkwardly compared to "100%"
+  // or "2%". These two convert between the two representations for the
+  // editable number input, rounding off the float noise that a bare `* 100`
+  // or `/ 100` would otherwise introduce (e.g. 0.02 * 100 !== 2 exactly).
+  // The rounding grid is the same on both sides (1e-6 of a percent, i.e. 1e-8
+  // of a ratio), which is orders of magnitude coarser than double precision
+  // noise and finer than any ratio worth configuring, so the round trip
+  // percent -> ratio -> percent is lossless for every realistic value.
+  function ratioToPercent(ratio) {
+    const n = Number(ratio);
+    return Number.isFinite(n) ? Math.round(n * 100 * 1e6) / 1e6 : '';
+  }
+
+  function percentToRatio(percent) {
+    const n = Number(percent);
+    return Number.isFinite(n) ? Math.round((n / 100) * 1e8) / 1e8 : NaN;
   }
 
   function fmtMs(value) {
@@ -1056,8 +1075,8 @@
     html += '<span class="chip"><span class="chip-k">synthetic prose</span><span class="chip-v">' +
       (llmOn ? esc((settings.llm_model || 'local model') + ' @ ' + (settings.llm_base_url || 'local')) : 'deterministic templates') +
       '</span></span>';
-    html += '<span class="chip"><span class="chip-k">chaff_ratio</span><span class="chip-v">' + esc(settings.chaff_ratio) + '</span></span>';
-    html += '<span class="chip"><span class="chip-k">honeytoken_rate</span><span class="chip-v">' + esc(settings.honeytoken_rate) + '</span></span>';
+    html += '<span class="chip"><span class="chip-k">chaff_ratio</span><span class="chip-v">' + fmtPct(settings.chaff_ratio) + '</span></span>';
+    html += '<span class="chip"><span class="chip-k">honeytoken_rate</span><span class="chip-v">' + fmtPct(settings.honeytoken_rate) + '</span></span>';
     html += '<span class="chip"><span class="chip-k">canaries</span><span class="chip-v">' + esc(settings.canaries_per_batch) + '</span></span>';
     html += '</div>';
     return html;
@@ -2520,10 +2539,18 @@
 
   // The four tunable pipeline numbers: each can be overridden or cleared back
   // to the config-file default (pipeline_defaults from the settings payload).
+  // chaff_ratio and honeytoken_rate carry `percent: true` - they are ratios
+  // in config.json and in the API, but a raw "0.02" reads far less clearly
+  // than "2%", so the input and its hint show and accept a percentage while
+  // ratioToPercent/percentToRatio convert at the edges (see submit handler).
   const PIPELINE_NUMBER_FIELDS = [
     { key: 'chunk_size_tokens', min: 1, step: 1 },
-    { key: 'chaff_ratio', min: 0, step: 0.1 },
-    { key: 'honeytoken_rate', min: 0, step: 0.01 },
+    // step 'any' rather than a fixed grid: the browser rejects a submit whose
+    // number falls between steps, so a grid of e.g. 5 would make 33% (a ratio
+    // of 0.33 that the backend accepts happily) unsaveable - and a config-file
+    // value off the grid would block the whole settings form.
+    { key: 'chaff_ratio', min: 0, step: 'any', percent: true },
+    { key: 'honeytoken_rate', min: 0, step: 'any', percent: true },
     { key: 'canaries_per_batch', min: 0, step: 1 },
   ];
 
@@ -2531,12 +2558,17 @@
     const defaults = settings.pipeline_defaults || {};
     let html = '';
     PIPELINE_NUMBER_FIELDS.forEach((f) => {
-      const value = settings[f.key] != null ? settings[f.key] : '';
-      const defaultValue = defaults[f.key] != null ? defaults[f.key] : '—';
-      html += '<div class="field"><label for="f-' + f.key + '">' + f.key + info(f.key) + '</label>';
+      const rawValue = settings[f.key];
+      const rawDefault = defaults[f.key];
+      const value = rawValue != null ? (f.percent ? ratioToPercent(rawValue) : rawValue) : '';
+      const defaultLabel = rawDefault != null
+        ? (f.percent ? fmtPct(rawDefault) : esc(rawDefault))
+        : '—';
+      const label = f.key + (f.percent ? ' (%)' : '');
+      html += '<div class="field"><label for="f-' + f.key + '">' + esc(label) + info(f.key) + '</label>';
       html += '<input type="number" id="f-' + f.key + '" name="' + f.key + '" min="' + f.min +
         '" step="' + f.step + '" value="' + esc(value) + '">';
-      html += '<div class="hint">Default ' + esc(defaultValue) +
+      html += '<div class="hint">Default ' + defaultLabel +
         ' — clear the field to fall back to it.</div></div>';
     });
     return html;
@@ -2653,7 +2685,9 @@
             fail('settings', new Error(f.key + ' must be a number >= ' + f.min + '.'));
             return;
           }
-          body[f.key] = num;
+          // percent fields are typed and validated in percent terms, then
+          // converted back to the ratio the API and config.json expect.
+          body[f.key] = f.percent ? percentToRatio(num) : num;
         }
 
         // Switches always send their current state — there is no "leave
