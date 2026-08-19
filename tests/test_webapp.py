@@ -54,6 +54,26 @@ migration plan for the reporting warehouse. The team agreed to ship the new
 connector before the end of the quarter and to review the remaining risks.
 """
 
+EMAIL_MARKDOWN = """# Contacts
+
+Jan Novak <jan.novak+press@mail.keboola.com> met Petra Svobodova at the Keboola
+office in Prague. Write to padak@keboola.com about the migration plan.
+"""
+
+SAMPLE_EMAILS = ("jan.novak+press@mail.keboola.com", "padak@keboola.com")
+
+URL_MARKDOWN = """# Links
+
+Jan Novak at Keboola forwarded the notice from
+https://resolve.picrights.com/Home/Settlement/3979-4561-9198 and asked us to
+check www.keboola.com/pricing. Reply to padak@keboola.com.
+"""
+
+SAMPLE_URLS = (
+    "https://resolve.picrights.com/Home/Settlement/3979-4561-9198",
+    "www.keboola.com/pricing",
+)
+
 MULTIBYTE_MARKDOWN = (
     "# Zápis z porady\n\n"
     "Petr Šimeček <petr@keboola.com> podepsal smlouvu s firmou Čerpadla Plzeň "
@@ -218,13 +238,18 @@ class FakeGenerator:
 
 
 class FakeHTTPClient:
-    """Stand-in for `httpx.Client` covering the one GET the preflight makes."""
+    """Stand-in for `httpx.Client`: the preflight GETs and the conversion POST."""
 
     def __init__(self) -> None:
         self.response: SimpleNamespace | None = None
         self.error: Exception | None = None
         self.requested: list[str] = []
         self.closed = False
+        self.timeouts: list[float] = []
+        # The conversion endpoint answers separately from the GET endpoints.
+        self.post_response: SimpleNamespace | None = None
+        self.post_error: Exception | None = None
+        self.posted: list[dict] = []
 
     def serve(self, model_ids: list[str], status_code: int = 200) -> None:
         """Answer as an OpenAI-compatible server offering `model_ids`."""
@@ -234,11 +259,24 @@ class FakeHTTPClient:
             json=lambda: {"data": [{"id": model_id} for model_id in model_ids]},
         )
 
+    def serve_conversion(self, markdown: str, status_code: int = 200) -> None:
+        """Answer as the external conversion service."""
+        self.post_error = None
+        self.post_response = SimpleNamespace(
+            status_code=status_code, json=lambda: {"markdown": markdown}
+        )
+
     def get(self, url: str) -> SimpleNamespace:
         self.requested.append(url)
         if self.error is not None:
             raise self.error
         return self.response
+
+    def post(self, url: str, files: dict) -> SimpleNamespace:
+        self.posted.append({"url": url, "files": files})
+        if self.post_error is not None:
+            raise self.post_error
+        return self.post_response
 
     def close(self) -> None:
         self.closed = True
@@ -323,7 +361,14 @@ def harness(tmp_path, monkeypatch) -> Harness:
     # local endpoint answers and serves exactly the configured model.
     http = FakeHTTPClient()
     http.serve([config.synthetic.llm.model])
-    monkeypatch.setattr(server, "get_http_client", lambda: http)
+
+    def fake_http_client(timeout: float = server.VERIFY_HTTP_TIMEOUT_SECONDS):
+        # The timeout is part of the contract: the conversion call must not run
+        # on the preflight's short one.
+        http.timeouts.append(timeout)
+        return http
+
+    monkeypatch.setattr(server, "get_http_client", fake_http_client)
 
     with TestClient(server.app) as client:
         yield Harness(
@@ -374,6 +419,13 @@ def set_concurrency(monkeypatch, workers: int) -> None:
     already installed.
     """
     config = with_concurrency(server.get_config(), workers)
+    monkeypatch.setattr(server, "get_config", lambda: config)
+
+
+def set_conversion_service(monkeypatch, service_url: str) -> None:
+    """Point the app at an external conversion service (empty = built-in)."""
+    config = server.get_config()
+    config = replace(config, conversion=replace(config.conversion, service_url=service_url))
     monkeypatch.setattr(server, "get_config", lambda: config)
 
 
@@ -548,6 +600,92 @@ def test_upload_html_is_converted_to_markdown(harness):
     assert "# Acme Report" in document["markdown"]
     assert "<p>" not in document["markdown"]
     assert "".join(chunk["text"] for chunk in document["chunks"]) == document["markdown"]
+
+
+def test_upload_uses_the_conversion_service_when_one_is_configured(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.serve_conversion("# Converted\n\nJan Novak signed it.\n")
+
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.pdf", b"%PDF-1.7 fake bytes", "application/pdf")},
+    )
+
+    assert response.status_code == 200, response.text
+    document = response.json()
+    assert document["markdown"] == "# Converted\n\nJan Novak signed it.\n"
+    assert len(harness.http.posted) == 1
+    call = harness.http.posted[0]
+    assert call["url"] == "http://converter:9000/convert"
+    filename, content = call["files"]["file"]
+    assert filename == "report.pdf"
+    assert content == b"%PDF-1.7 fake bytes"
+    # Converting is the slow call, so it must not run on the preflight timeout.
+    assert harness.http.timeouts[-1] == server.CONVERT_TIMEOUT_SECONDS
+
+
+def test_markdown_upload_never_reaches_the_conversion_service(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+
+    document = upload_markdown(harness)
+
+    assert document["markdown"] == SAMPLE_MARKDOWN
+    assert harness.http.posted == []
+
+
+def test_upload_falls_back_to_markitdown_without_a_service(harness):
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.html", SAMPLE_HTML.encode("utf-8"), "text/html")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "# Acme Report" in response.json()["markdown"]
+    assert harness.http.posted == []
+
+
+def test_upload_reports_an_unreachable_conversion_service(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.post_error = httpx.ConnectError("connection refused")
+
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.pdf", b"%PDF-1.7", "application/pdf")},
+    )
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "http://converter:9000/convert" in detail
+    assert "unreachable" in detail
+
+
+def test_upload_reports_a_conversion_service_error_response(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.serve_conversion("", status_code=500)
+
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.pdf", b"%PDF-1.7", "application/pdf")},
+    )
+
+    assert response.status_code == 502
+    assert "500" in response.json()["detail"]
+
+
+def test_upload_reports_a_conversion_service_payload_without_markdown(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.post_error = None
+    harness.http.post_response = SimpleNamespace(
+        status_code=200, json=lambda: {"text": "wrong field"}
+    )
+
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.pdf", b"%PDF-1.7", "application/pdf")},
+    )
+
+    assert response.status_code == 502
+    assert "unexpected payload" in response.json()["detail"]
 
 
 def test_upload_of_an_empty_document_is_rejected(harness):
@@ -1078,6 +1216,62 @@ def test_redaction_without_detection_returns_the_original(harness):
     assert payload["redacted"] == payload["original"] == SAMPLE_MARKDOWN
 
 
+def test_redaction_reports_and_removes_email_addresses(harness):
+    document = upload_markdown(harness, name="contacts.md", text=EMAIL_MARKDOWN)
+    arm_provider(harness, document)
+    detect(harness, document["doc_id"])
+    config = load_config()
+
+    payload = harness.client.get(
+        f"/api/documents/{document['doc_id']}/redaction"
+    ).json()
+
+    reported = {item["text"] for item in payload["entities"] if item["type"] == "email"}
+    assert reported == set(SAMPLE_EMAILS)
+    assert config.redaction.email in payload["redacted"]
+    for address in SAMPLE_EMAILS:
+        assert address not in payload["redacted"]
+    # The local part is a person's name, and it must not survive next to a
+    # redacted domain the way it used to.
+    assert "jan.novak" not in payload["redacted"]
+
+
+def test_redaction_reports_and_removes_urls(harness):
+    document = upload_markdown(harness, name="links.md", text=URL_MARKDOWN)
+    arm_provider(harness, document)
+    detect(harness, document["doc_id"])
+    config = load_config()
+
+    payload = harness.client.get(
+        f"/api/documents/{document['doc_id']}/redaction"
+    ).json()
+
+    reported = {item["text"] for item in payload["entities"] if item["type"] == "url"}
+    assert reported == set(SAMPLE_URLS)
+    assert config.redaction.url in payload["redacted"]
+    for address in SAMPLE_URLS:
+        assert address not in payload["redacted"]
+    # The identifying path segment is gone, not just the host.
+    assert "3979-4561-9198" not in payload["redacted"]
+    # All three deterministic and detected kinds coexist in one document.
+    assert config.redaction.email in payload["redacted"]
+    assert config.redaction.person in payload["redacted"]
+
+
+def test_redaction_removes_emails_without_any_detection(harness):
+    # Emails need no detector: nothing has been sent to the provider here.
+    document = upload_markdown(harness, name="contacts.md", text=EMAIL_MARKDOWN)
+
+    payload = harness.client.get(
+        f"/api/documents/{document['doc_id']}/redaction"
+    ).json()
+
+    assert [item["type"] for item in payload["entities"]] == ["email"] * len(SAMPLE_EMAILS)
+    for address in SAMPLE_EMAILS:
+        assert address in payload["original"]
+        assert address not in payload["redacted"]
+
+
 # ---------------------------------------------------------------------------
 # synthetic report
 # ---------------------------------------------------------------------------
@@ -1119,7 +1313,13 @@ def verify(harness: Harness) -> dict[str, dict]:
     assert response.status_code == 200, response.text
     payload = response.json()
     checks = {check["name"]: check for check in payload["checks"]}
-    assert set(checks) == {"anthropic", "local_llm", "markitdown", "database"}
+    assert set(checks) == {
+        "anthropic",
+        "local_llm",
+        "markitdown",
+        "conversion",
+        "database",
+    }
     for check in payload["checks"]:
         assert check["label"]
         assert isinstance(check["ok"], bool)
@@ -1228,6 +1428,51 @@ def test_verify_skips_the_local_llm_when_it_is_switched_off(harness):
     assert checks["all_ok"] is True
 
 
+def test_verify_passes_the_conversion_check_without_a_service(harness):
+    checks = verify(harness)
+
+    assert checks["conversion"]["ok"] is True
+    assert "markitdown" in checks["conversion"]["detail"]
+    # A feature deliberately not in use is never probed.
+    assert all("/health" not in url for url in harness.http.requested)
+
+
+def test_verify_probes_a_configured_conversion_service(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000/")
+    harness.http.response = SimpleNamespace(
+        status_code=200, json=lambda: {"status": "ok", "engine": "pymupdf"}
+    )
+
+    checks = verify(harness)
+
+    assert checks["conversion"]["ok"] is True
+    assert "engine=pymupdf" in checks["conversion"]["detail"]
+    assert "http://converter:9000/health" in harness.http.requested
+
+
+def test_verify_reports_an_unreachable_conversion_service(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.error = httpx.ConnectError("connection refused")
+
+    checks = verify(harness)
+
+    assert checks["conversion"]["ok"] is False
+    assert "http://converter:9000/health" in checks["conversion"]["detail"]
+    assert "conversion.service_url" in checks["conversion"]["detail"]
+    assert checks["all_ok"] is False
+
+
+def test_verify_reports_a_conversion_service_error_response(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.error = None
+    harness.http.response = SimpleNamespace(status_code=503, json=lambda: {})
+
+    checks = verify(harness)
+
+    assert checks["conversion"]["ok"] is False
+    assert "503" in checks["conversion"]["detail"]
+
+
 def test_verify_reports_a_broken_converter(harness, monkeypatch):
     def broken() -> None:
         raise RuntimeError("markitdown is not installed")
@@ -1265,6 +1510,91 @@ def test_verify_reports_an_unusable_database(harness, monkeypatch):
     assert checks["database"]["ok"] is False
     assert "unable to open database file" in checks["database"]["detail"]
     assert checks["all_ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# offered local models
+# ---------------------------------------------------------------------------
+
+
+def test_llm_models_reports_the_catalog_and_what_is_installed(harness):
+    config = load_config()
+    catalogued = [entry.model for entry in config.synthetic.llm.catalog]
+    harness.http.serve([catalogued[0], "some-other-model"])
+
+    payload = harness.client.get("/api/llm-models").json()
+
+    assert payload["llm_reachable"] is True
+    assert payload["available"] == [catalogued[0], "some-other-model"]
+    assert payload["catalog_note"] == config.synthetic.llm.catalog_note
+    assert [entry["model"] for entry in payload["catalog"]] == catalogued
+    # Every measured figure travels with the entry: the view renders them.
+    for entry, configured in zip(payload["catalog"], config.synthetic.llm.catalog):
+        assert entry["size"] == configured.size
+        assert entry["seconds_per_fragment"] == pytest.approx(
+            configured.seconds_per_fragment
+        )
+        assert entry["first_try_validity"] == pytest.approx(
+            configured.first_try_validity
+        )
+        assert entry["note"] == configured.note
+    availability = {entry["model"]: entry["available"] for entry in payload["catalog"]}
+    assert availability[catalogued[0]] is True
+    assert all(value is False for model, value in availability.items() if model != catalogued[0])
+    assert harness.http.requested == [f"{config.synthetic.llm.base_url}/models"]
+
+
+def test_llm_models_accepts_the_implicit_ollama_latest_tag(harness):
+    config = load_config()
+    catalogued = [entry.model for entry in config.synthetic.llm.catalog]
+    harness.http.serve([f"{catalogued[1]}:latest"])
+
+    payload = harness.client.get("/api/llm-models").json()
+
+    availability = {entry["model"]: entry["available"] for entry in payload["catalog"]}
+    assert availability[catalogued[1]] is True
+
+
+def test_llm_models_reports_an_unreachable_local_server(harness):
+    harness.http.error = httpx.ConnectError("connection refused")
+
+    payload = harness.client.get("/api/llm-models").json()
+
+    assert payload["llm_reachable"] is False
+    assert payload["available"] == []
+    # The catalog is config data, so it is offered whatever the server does.
+    assert payload["catalog"]
+    assert all(entry["available"] is False for entry in payload["catalog"])
+
+
+def test_llm_models_treats_an_error_response_as_nothing_installed(harness):
+    harness.http.serve([], status_code=503)
+
+    payload = harness.client.get("/api/llm-models").json()
+
+    assert payload["llm_reachable"] is False
+    assert payload["available"] == []
+
+
+def test_llm_models_survives_an_unexpected_payload(harness):
+    harness.http.response = SimpleNamespace(
+        status_code=200, json=lambda: {"models": ["not-the-openai-shape"]}
+    )
+    harness.http.error = None
+
+    payload = harness.client.get("/api/llm-models").json()
+
+    assert payload["llm_reachable"] is False
+    assert payload["available"] == []
+
+
+def test_llm_models_follows_the_configured_base_url_override(harness):
+    harness.client.put("/api/settings", json={"llm_base_url": "http://elsewhere:1234/v1"})
+    harness.http.requested.clear()
+
+    harness.client.get("/api/llm-models")
+
+    assert harness.http.requested == ["http://elsewhere:1234/v1/models"]
 
 
 # ---------------------------------------------------------------------------

@@ -495,8 +495,13 @@ class ChunkStore:
 
         Returns:
             One dict per batch with the keys `batch_id`, `honeytokens_scored`,
-            `planted_total`, `found_total` and `recall`, ordered by batch id.
-            `recall` is 0.0 for the degenerate case of nothing planted.
+            `planted_total`, `found_total`, `recall`, `created_at`,
+            `documents` and `fragments_total`, ordered by batch id. `recall` is
+            0.0 for the degenerate case of nothing planted.
+
+        The last three are context rather than measurement: a bare batch id
+        says nothing about when the run happened, which document it carried or
+        how much it carried, and a recall figure is only readable next to that.
         """
         cursor = self._connection.execute(
             """
@@ -528,12 +533,55 @@ class ChunkStore:
                 1 for name, _ in planted if name in found_names
             )
 
-        for entry in stats.values():
+        context = self._batch_context(list(stats))
+        for batch_id, entry in stats.items():
             planted_total = entry["planted_total"]
             entry["recall"] = (
                 entry["found_total"] / planted_total if planted_total else 0.0
             )
+            entry.update(context[batch_id])
         return [stats[batch_id] for batch_id in sorted(stats)]
+
+    def _batch_context(self, batch_ids: list[str]) -> dict[str, dict]:
+        """When each batch ran, which documents it carried and how big it was.
+
+        A batch recorded by an older build - or one whose chunks were since
+        removed - still gets an entry, with the fields it has no answer for
+        left empty: a missing row must not drop a measured batch from a report.
+        """
+        context = {
+            batch_id: {"created_at": None, "documents": [], "fragments_total": 0}
+            for batch_id in batch_ids
+        }
+        if not batch_ids:
+            return context
+
+        placeholders = ",".join("?" for _ in batch_ids)
+        for row in self._connection.execute(
+            f"SELECT batch_id, created_at FROM batches WHERE batch_id IN ({placeholders})",
+            batch_ids,
+        ):
+            context[row["batch_id"]]["created_at"] = row["created_at"]
+
+        for row in self._connection.execute(
+            "SELECT c.batch_id AS batch_id, d.path AS path, COUNT(*) AS chunks "
+            "FROM chunks c JOIN documents d ON d.doc_id = c.doc_id "
+            f"WHERE c.batch_id IN ({placeholders}) "
+            "GROUP BY c.batch_id, d.path ORDER BY d.path",
+            batch_ids,
+        ):
+            entry = context[row["batch_id"]]
+            entry["documents"].append(row["path"])
+            entry["fragments_total"] += row["chunks"]
+
+        for row in self._connection.execute(
+            "SELECT batch_id, COUNT(*) AS fragments FROM synthetic_fragments "
+            f"WHERE batch_id IN ({placeholders}) GROUP BY batch_id",
+            batch_ids,
+        ):
+            context[row["batch_id"]]["fragments_total"] += row["fragments"]
+
+        return context
 
     # ------------------------------------------------------------------
     # canary probes

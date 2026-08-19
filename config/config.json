@@ -7,6 +7,9 @@
   "database": {
     "path": "data/chunks.db"
   },
+  "conversion": {
+    "service_url": ""
+  },
   "anthropic": {
     "model": "claude-opus-5",
     "effort": "low",
@@ -15,7 +18,9 @@
   },
   "redaction": {
     "person": "**PERSON**",
-    "company": "**COMPANY**"
+    "company": "**COMPANY**",
+    "email": "**EMAIL**",
+    "url": "**URL**"
   },
   "synthetic": {
     "honeytokens_enabled": true,
@@ -31,7 +36,31 @@
       "base_url": "http://localhost:11434/v1",
       "model": "qwen2.5:7b",
       "temperature": 0.8,
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "catalog": [
+        {
+          "model": "llama3.2:1b",
+          "size": "1.3 GB",
+          "seconds_per_fragment": 1.0,
+          "first_try_validity": 0.94,
+          "note": "2x faster than 7b, nearly everything passes validation"
+        },
+        {
+          "model": "qwen2.5:1.5b",
+          "size": "1.0 GB",
+          "seconds_per_fragment": 0.9,
+          "first_try_validity": 0.81,
+          "note": "fastest, more template fallbacks"
+        },
+        {
+          "model": "qwen2.5:7b",
+          "size": "4.7 GB",
+          "seconds_per_fragment": 1.7,
+          "first_try_validity": 1.0,
+          "note": "most faithful prose"
+        }
+      ],
+      "catalog_note": "Measured on Apple M3 Pro with warm models; figures differ per machine."
     }
   }
 }

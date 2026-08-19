@@ -15,6 +15,18 @@
   const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
   const INTRO_KEY = 'dq.intro.dismissed';
   const LOG_LIMIT = 4000;
+  // How much of an id a table shows before eliding it; the full value stays in
+  // the element's title and on the clipboard.
+  const SHORT_ID_CHARS = 8;
+
+  // The two synthetic-prose choices that are not a catalogued model id.
+  const CHOICE_TEMPLATES = 'templates';
+  const CHOICE_CUSTOM = 'custom';
+
+  // Hover text for a chunk id: users kept reading it as a position in the
+  // document, which is exactly what it is not.
+  const CHUNK_ID_TITLE = 'Random ID this fragment travels under — appears as ' +
+    'custom_id in Batch and LLM I/O; order (seq) never leaves this machine.';
 
   const STEPS = [
     { id: 'document', n: 1, label: 'Document' },
@@ -105,8 +117,9 @@
 
   const REMEDY = {
     anthropic: 'Paste a valid key into the Anthropic API key field above and save.',
-    local_llm: 'Start the local model server (for example: ollama serve) and pull the configured model, or turn off "Use local LLM for synthetic prose".',
+    local_llm: 'Start the local model server (for example: ollama serve) and pull the configured model, or pick "Deterministic templates" as the synthetic prose generator.',
     markitdown: 'Install the markitdown package into the server environment.',
+    conversion: 'Start the external conversion service, or clear conversion.service_url in config/config.json to use the built-in converter.',
     database: 'Check that the data directory exists and is writable by the server process.',
   };
 
@@ -122,6 +135,9 @@
     redaction: null,         // GET .../redaction payload (+ has_detection, chunk_count, ...)
     redactionDocId: null,
     report: null,
+    probePlanned: null,      // how many probe calls the running probe is making
+    llmModels: null,         // GET /api/llm-models payload
+    llmChoice: null,         // picked prose generator, null until the user picks
     verify: null,            // POST /api/verify payload
     verifyError: null,       // why the check itself could not run
     verifyAuto: false,
@@ -136,6 +152,7 @@
       probe: false,
       settings: false,
       verify: false,
+      llmModels: false,
     },
     alerts: {},              // view -> { kind, text }
   };
@@ -187,6 +204,12 @@
     return d.toLocaleString();
   }
 
+  /** The first segment of an id: enough to tell two runs apart in a table. */
+  function shortId(value) {
+    const text = String(value === undefined || value === null ? '' : value);
+    return text.length > SHORT_ID_CHARS ? text.slice(0, SHORT_ID_CHARS) + '…' : text;
+  }
+
   function basename(path) {
     if (!path) return '';
     const parts = String(path).split(/[\\/]/);
@@ -225,11 +248,14 @@
     return '<span class="pill pill-' + known + '">' + esc(s) + '</span>';
   }
 
-  function copyId(value, label) {
+  function copyId(value, label, title) {
     if (!value) return '<span class="mono dim">—</span>';
     const text = label === undefined ? value : label;
+    // `title` explains what this particular id is; the copy hint is appended
+    // so the click behaviour stays discoverable either way.
+    const hint = 'Click to copy ' + value;
     return '<button type="button" class="copy-id" data-copy="' + esc(value) +
-      '" title="Click to copy ' + esc(value) + '">' + esc(text) + '</button>';
+      '" title="' + esc(title ? title + ' — ' + hint : hint) + '">' + esc(text) + '</button>';
   }
 
   /** A circled "i" that opens the plain-language definition of `key`. */
@@ -612,6 +638,9 @@
       store.verifyAuto = true;
       runVerify();
     }
+    if (view === 'settings' && !store.llmModels && !store.busy.llmModels) {
+      fetchLlmModels();
+    }
   }
 
   // -------------------------------------------------------- view: document
@@ -838,6 +867,11 @@
       fmtInt(extended) + '</div><div class="stat-sub">boundary moved to keep a name whole</div></div>';
     html += '</div>';
 
+    const chunkSize = store.settings ? Number(store.settings.chunk_size_tokens) : NaN;
+    html += '<p class="page-lead">Alternating shading marks token boundaries — the units the ' +
+      (Number.isFinite(chunkSize) ? fmtInt(chunkSize) + '-token' : 'token-sized') +
+      ' cuts are made of.</p>';
+
     if (!chunks.length) {
       root.innerHTML = html + emptyState('No chunks', 'This document produced no chunks.');
       return;
@@ -850,7 +884,7 @@
       html += '<header class="chunk-head">';
       html += '<span class="chunk-seq">seq ' +
         esc(chunk.seq === null || chunk.seq === undefined ? '?' : chunk.seq) + '</span>';
-      html += copyId(chunk.chunk_id);
+      html += copyId(chunk.chunk_id, undefined, CHUNK_ID_TITLE);
       if (chunk.extended === true) {
         html += '<span class="badge badge-extended" title="the cut was moved so a name is never split in half">extended cut</span>';
       }
@@ -1513,7 +1547,8 @@
   function entityHtml(entity) {
     const type = String(entity && entity.type ? entity.type : 'unknown');
     const upper = type.toUpperCase();
-    const cls = upper === 'PERSON' ? 'person' : (upper === 'COMPANY' ? 'company' : 'other');
+    const KNOWN = { PERSON: 'person', COMPANY: 'company', EMAIL: 'email', URL: 'url' };
+    const cls = KNOWN[upper] || 'other';
     return '<span class="ent"><span class="ent-text">' + esc(entity && entity.text ? entity.text : '') +
       '</span><span class="ent-type ent-type-' + cls + '">' + esc(upper) + '</span></span>';
   }
@@ -1690,7 +1725,7 @@
 
   function highlightRedacted(text) {
     // esc() leaves the literal ** markers intact, so highlight after escaping.
-    return esc(text).replace(/\*\*(PERSON|COMPANY)\*\*/g,
+    return esc(text).replace(/\*\*(PERSON|COMPANY|EMAIL|URL)\*\*/g,
       (match, label) => '<mark class="redacted">**' + label + '**</mark>');
   }
 
@@ -1851,7 +1886,8 @@
     html += '<button type="button" class="btn" id="refresh-report"' + (store.busy.report ? ' disabled' : '') + '>' +
       (store.busy.report ? '<span class="spinner"></span>Loading' : 'Refresh') + '</button>';
     html += '<button type="button" class="btn btn-primary" id="run-probe"' + (store.busy.probe ? ' disabled' : '') + '>' +
-      (store.busy.probe ? '<span class="spinner"></span>Probing' : 'Run canary probe') + '</button>' + info('probe');
+      (store.busy.probe ? '<span class="spinner"></span>' + probeBusyLabel() : 'Run canary probe') +
+      '</button>' + info('probe');
     html += '</div></div></div>';
 
     html += hintHtml('report');
@@ -1893,11 +1929,17 @@
       html += emptyState('No batches scored', 'Run detection to plant and score honeytokens.');
     } else {
       html += '<div class="table-wrap"><table class="tbl"><thead><tr>';
-      html += '<th>batch_id</th><th>scored</th><th>planted</th><th>found</th><th>recall</th>';
+      html += '<th>Started</th><th>Document</th><th>batch</th>' +
+        '<th>fragments</th><th>scored</th><th>planted</th><th>found</th><th>recall</th>';
       html += '</tr></thead><tbody>';
       stats.forEach((row) => {
+        const documents = safeArray(row.documents).join(', ');
         html += '<tr>';
-        html += '<td>' + copyId(row.batch_id) + '</td>';
+        html += '<td class="mono" style="white-space:nowrap">' + esc(fmtDate(row.created_at)) + '</td>';
+        html += '<td><span class="doc-cell" title="' + esc(documents || 'no document') + '">' +
+          esc(documents || '—') + '</span></td>';
+        html += '<td class="id-cell">' + copyId(row.batch_id, shortId(row.batch_id), 'Batch id') + '</td>';
+        html += '<td class="mono">' + fmtInt(row.fragments_total) + '</td>';
         html += '<td class="mono">' + fmtInt(row.honeytokens_scored) + '</td>';
         html += '<td class="mono">' + fmtInt(row.planted_total) + '</td>';
         html += '<td class="mono">' + fmtInt(row.found_total) + '</td>';
@@ -1955,6 +1997,13 @@
     }
   }
 
+  /** What the probe button says while it works: the wait has a size. */
+  function probeBusyLabel() {
+    const planned = store.probePlanned;
+    if (!Number.isFinite(planned) || planned <= 0) return 'Probing';
+    return 'Probing ' + fmtInt(planned) + ' canar' + (planned === 1 ? 'y' : 'ies') + '…';
+  }
+
   async function runCanaryProbe() {
     if (store.busy.probe) return;
 
@@ -1972,6 +2021,7 @@
 
     clearAlert('report');
     store.busy.probe = true;
+    store.probePlanned = planned;
     render();
 
     try {
@@ -1990,6 +2040,7 @@
       fail('report', err);
     } finally {
       store.busy.probe = false;
+      store.probePlanned = null;
     }
 
     try {
@@ -2071,6 +2122,89 @@
     return html;
   }
 
+  /** Which generator the form is currently offering to save. */
+  function generatorChoice(settings, catalog) {
+    if (store.llmChoice !== null) return store.llmChoice;
+    if (!settings || settings.llm_enabled === false) return CHOICE_TEMPLATES;
+    const model = settings.llm_model || '';
+    return catalog.some((entry) => entry.model === model) ? model : CHOICE_CUSTOM;
+  }
+
+  /** One radio card. `disabled` keeps an unpulled model visible but unpickable. */
+  function choiceCardHtml(value, checked, disabled, title, sub, meta, chip) {
+    let html = '<label class="choice' + (checked ? ' is-picked' : '') +
+      (disabled ? ' is-disabled' : '') + '">';
+    html += '<input type="radio" name="llm-choice" value="' + esc(value) + '"' +
+      (checked ? ' checked' : '') + (disabled ? ' disabled' : '') + '>';
+    html += '<span class="choice-body">';
+    html += '<span class="choice-head"><span class="choice-title">' + esc(title) + '</span>' +
+      (chip || '') + '</span>';
+    if (meta) html += '<span class="choice-meta">' + meta + '</span>';
+    html += '<span class="choice-sub">' + esc(sub) + '</span>';
+    html += '</span></label>';
+    return html;
+  }
+
+  /** The "Synthetic prose generator" picker: templates, catalogued models, custom. */
+  function generatorChoiceHtml(settings) {
+    const data = store.llmModels;
+    const catalog = safeArray(data && data.catalog);
+    const choice = generatorChoice(settings, catalog);
+
+    let html = '<div class="field" style="grid-column:1/-1">';
+    html += '<label>Synthetic prose generator' + info('local_llm') + '</label>';
+    html += '<div class="hint">Who phrases the honeytoken and chaff fragments. A local model makes the decoys read like natural prose; ' +
+      'templates need nothing installed. Either way the generator never sees your document.</div>';
+
+    html += '<div class="choice-grid" id="llm-choice">';
+    html += choiceCardHtml(CHOICE_TEMPLATES, choice === CHOICE_TEMPLATES, false,
+      'Deterministic templates', 'instant, no local server, uniform style', '', '');
+
+    catalog.forEach((entry) => {
+      const model = String(entry.model || '');
+      const available = entry.available === true;
+      const chip = available
+        ? '<span class="choice-chip choice-chip-ok">available</span>'
+        : '<span class="choice-chip choice-chip-off">not pulled — ollama pull ' + esc(model) + '</span>';
+      const meta = '<span class="choice-stat">' + esc(entry.size || '—') + '</span>' +
+        '<span class="choice-stat">~' + esc(fmtSecondsPerFragment(entry.seconds_per_fragment)) + ' s/fragment</span>' +
+        '<span class="choice-stat">' + esc(fmtPct(entry.first_try_validity)) + ' first-try valid</span>';
+      html += choiceCardHtml(model, choice === model, !available, model,
+        entry.note || '', meta, chip);
+    });
+
+    html += choiceCardHtml(CHOICE_CUSTOM, choice === CHOICE_CUSTOM, false,
+      'Custom', 'any other model served by the local endpoint', '', '');
+    html += '</div>';
+
+    if (store.busy.llmModels && !catalog.length) {
+      html += '<div class="hint"><span class="spinner"></span>Asking the local server which models it has…</div>';
+    }
+    if (data && data.llm_reachable === false) {
+      html += '<div class="hint">The local server did not answer, so nothing can be reported as pulled. ' +
+        'Start it (ollama serve) and reload this page, or stay on deterministic templates.</div>';
+    }
+    if (data && data.catalog_note) {
+      html += '<div class="hint small">' + esc(data.catalog_note) + '</div>';
+    }
+
+    html += '<div class="field" id="llm-custom-field"' +
+      (choice === CHOICE_CUSTOM ? '' : ' hidden') + ' style="margin-top:10px">';
+    html += '<label for="f-llm-model">Custom local model</label>';
+    html += '<input type="text" id="f-llm-model" name="llm_model" value="' +
+      esc(settings.llm_model || '') + '" placeholder="model id as the local server names it">';
+    html += '</div>';
+
+    html += '</div>';
+    return html;
+  }
+
+  /** "1.0" rather than "1" — a measured figure keeps its decimal. */
+  function fmtSecondsPerFragment(value) {
+    const seconds = Number(value);
+    return Number.isFinite(seconds) ? seconds.toFixed(1) : '?';
+  }
+
   function renderSettings(root) {
     const settings = store.settings;
 
@@ -2100,7 +2234,6 @@
 
     const efforts = EFFORTS.slice();
     if (settings.effort && !efforts.includes(settings.effort)) efforts.unshift(settings.effort);
-    const llmOn = settings.llm_enabled !== false;
 
     html += '<h3 class="section-title">Configuration</h3>';
     html += '<form class="card" id="settings-form" autocomplete="off">';
@@ -2125,19 +2258,10 @@
     });
     html += '</select></div>';
 
-    html += '<div class="field" style="grid-column:1/-1">';
-    html += '<label for="f-llm-enabled" style="cursor:pointer">' +
-      '<input type="checkbox" id="f-llm-enabled" name="llm_enabled"' + (llmOn ? ' checked' : '') + '> ' +
-      'Use local LLM for synthetic prose' + info('local_llm') + '</label>';
-    html += '<div class="hint">ON — honeytokens and chaff are phrased by the local model, so the decoys read like natural prose ' +
-      '(slower: roughly a minute of generation per batch). OFF — instant deterministic templates, no local server needed.</div>';
-    html += '</div>';
+    html += generatorChoiceHtml(settings);
 
     html += '<div class="field"><label for="f-base">Local LLM base URL</label>';
     html += '<input type="text" id="f-base" name="llm_base_url" value="' + esc(settings.llm_base_url || '') + '"></div>';
-
-    html += '<div class="field"><label for="f-llm-model">Local LLM model</label>';
-    html += '<input type="text" id="f-llm-model" name="llm_model" value="' + esc(settings.llm_model || '') + '"></div>';
 
     html += '</div>';
 
@@ -2183,6 +2307,21 @@
       });
     }
 
+    // Picking a generator only moves the highlight and reveals the custom
+    // field; nothing is saved until the form is submitted.
+    root.querySelectorAll('input[name="llm-choice"]').forEach((radio) => {
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return;
+        store.llmChoice = radio.value;
+        root.querySelectorAll('#llm-choice .choice').forEach((card) => {
+          const input = card.querySelector('input[name="llm-choice"]');
+          card.classList.toggle('is-picked', Boolean(input && input.checked));
+        });
+        const custom = root.querySelector('#llm-custom-field');
+        if (custom) custom.hidden = radio.value !== CHOICE_CUSTOM;
+      });
+    });
+
     const form = root.querySelector('#settings-form');
     if (form) {
       form.addEventListener('submit', (event) => {
@@ -2191,16 +2330,26 @@
         const effortNode = root.querySelector('#f-effort');
         const baseNode = root.querySelector('#f-base');
         const llmModelNode = root.querySelector('#f-llm-model');
-        const llmEnabledNode = root.querySelector('#f-llm-enabled');
+        const pickedNode = root.querySelector('input[name="llm-choice"]:checked');
         const keyNode = root.querySelector('#f-key');
 
         const body = {
           model: modelNode ? (modelNode.value || '').trim() : '',
           effort: effortNode ? effortNode.value : '',
           llm_base_url: baseNode ? (baseNode.value || '').trim() : '',
-          llm_model: llmModelNode ? (llmModelNode.value || '').trim() : '',
-          llm_enabled: llmEnabledNode ? Boolean(llmEnabledNode.checked) : true,
         };
+
+        // Templates leave llm_model alone: the model a user picked earlier is
+        // still the one they meant if they switch the generator back on.
+        const picked = pickedNode ? pickedNode.value : CHOICE_TEMPLATES;
+        if (picked === CHOICE_TEMPLATES) {
+          body.llm_enabled = false;
+        } else {
+          body.llm_enabled = true;
+          body.llm_model = picked === CHOICE_CUSTOM
+            ? (llmModelNode ? (llmModelNode.value || '').trim() : '')
+            : picked;
+        }
         // Never send an empty key: that would clear a stored one by accident.
         const key = keyNode ? keyNode.value : '';
         if (key && key.trim()) body.anthropic_api_key = key.trim();
@@ -2214,6 +2363,25 @@
         if (!window.confirm('Clear the stored Anthropic API key? Detection will fail until a new key is set.')) return;
         saveSettings({ anthropic_api_key: '' }, 'API key cleared.');
       });
+    }
+  }
+
+  /** Load the offered generators and which of them the local server has.
+   *
+   * A failure here is not reported as a settings error: the picker still shows
+   * the templates and custom choices, which is enough to configure the app.
+   */
+  async function fetchLlmModels() {
+    if (store.busy.llmModels) return;
+    store.busy.llmModels = true;
+    try {
+      store.llmModels = await api('/api/llm-models');
+    } catch (err) {
+      // The picker degrades to templates + custom, which is still usable.
+      store.llmModels = null;
+    } finally {
+      store.busy.llmModels = false;
+      render();
     }
   }
 
@@ -2232,7 +2400,10 @@
       store.busy.settings = false;
       render();
     }
-    // Configuration changed, so the previous verdict is stale.
+    // Configuration changed, so the previous verdict and the availability of
+    // the offered models (the base URL may have moved) are both stale.
+    store.llmModels = null;
+    fetchLlmModels();
     runVerify();
   }
 

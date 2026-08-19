@@ -285,7 +285,48 @@ def test_honeytoken_stats_computes_recall(store: ChunkStore) -> None:
         "planted_total": 3,
         "found_total": 2,
         "recall": pytest.approx(2 / 3),
+        # Nothing was submitted under this id, so there is no context to add.
+        "created_at": None,
+        "documents": [],
+        "fragments_total": 0,
     }
+
+
+def test_honeytoken_stats_carry_the_batch_context(store: ChunkStore) -> None:
+    """A recall figure is only readable next to when, what and how much."""
+    _planted_honeytokens(store)
+    doc_id = store.add_document("reports/quarterly.md", CHUNKS)
+    chunk_ids = [chunk["chunk_id"] for chunk in store.get_document_chunks(doc_id)]
+    store.record_batch("batch_abc", "sync")
+    store.mark_chunks_submitted(chunk_ids, "batch_abc")
+    store.mark_synthetic_submitted(["h1", "h2"], "batch_abc")
+
+    store.record_honeytoken_result("h1", "batch_abc", [("Alpha One", "person")])
+    store.record_honeytoken_result("h2", "batch_abc", [])
+
+    row = store.honeytoken_stats()[0]
+    assert row["documents"] == ["reports/quarterly.md"]
+    # Every real chunk plus every synthetic fragment that travelled with it.
+    assert row["fragments_total"] == len(CHUNKS) + 2
+    assert row["created_at"]
+    assert row["created_at"] == store.list_batches()[0]["created_at"]
+
+
+def test_honeytoken_stats_report_every_document_in_a_batch(store: ChunkStore) -> None:
+    _planted_honeytokens(store)
+    first = store.add_document("a.md", ["Alpha text."])
+    second = store.add_document("b.md", ["Beta text."])
+    store.record_batch("batch_abc", "sync")
+    for doc_id in (first, second):
+        store.mark_chunks_submitted(
+            [chunk["chunk_id"] for chunk in store.get_document_chunks(doc_id)],
+            "batch_abc",
+        )
+    store.record_honeytoken_result("h1", "batch_abc", [])
+
+    row = store.honeytoken_stats()[0]
+    assert row["documents"] == ["a.md", "b.md"]
+    assert row["fragments_total"] == 2
 
 
 def test_honeytoken_stats_ignores_the_reported_type(store: ChunkStore) -> None:

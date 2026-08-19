@@ -38,6 +38,20 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class ConversionConfig:
+    """Where uploaded documents are turned into Markdown.
+
+    `service_url` points at an optional external conversion service, kept in
+    its own repository because the libraries that convert a PDF well are
+    AGPL-licensed and this project is Apache-2.0. An empty string means the
+    feature is off and the built-in markitdown converter is used, which is the
+    default: nothing has to be running for the app to work.
+    """
+
+    service_url: str
+
+
+@dataclass(frozen=True)
 class AnthropicConfig:
     model: str
     effort: str
@@ -52,6 +66,28 @@ class AnthropicConfig:
 class RedactionConfig:
     person: str
     company: str
+    # Email addresses and URLs are regex-detectable, so they are replaced whole
+    # and deterministically, without the detector ever seeing them.
+    email: str
+    url: str
+
+
+@dataclass(frozen=True)
+class LLMCatalogEntry:
+    """One offered local model, with what it costs and how well it behaves.
+
+    The figures are measurements, not promises: they were taken on one machine
+    and live in the config so they can be re-measured and corrected without a
+    code change.
+    """
+
+    model: str
+    size: str
+    seconds_per_fragment: float
+    # Share of generations that pass validation on the first attempt; the rest
+    # fall back to a deterministic template.
+    first_try_validity: float
+    note: str
 
 
 @dataclass(frozen=True)
@@ -68,6 +104,10 @@ class SyntheticLLMConfig:
     model: str
     temperature: float
     timeout_seconds: float
+    # The models the app offers to choose from, and one line about where the
+    # numbers came from.
+    catalog: tuple[LLMCatalogEntry, ...]
+    catalog_note: str
 
 
 @dataclass(frozen=True)
@@ -95,6 +135,7 @@ class SyntheticConfig:
 class AppConfig:
     chunking: ChunkingConfig
     database: DatabaseConfig
+    conversion: ConversionConfig
     anthropic: AnthropicConfig
     redaction: RedactionConfig
     synthetic: SyntheticConfig
@@ -128,7 +169,14 @@ def load_config(path: Path | None = None) -> AppConfig:
     with open(config_path, encoding="utf-8") as f:
         raw = json.load(f)
 
-    for section in ("chunking", "database", "anthropic", "redaction", "synthetic"):
+    for section in (
+        "chunking",
+        "database",
+        "conversion",
+        "anthropic",
+        "redaction",
+        "synthetic",
+    ):
         if section not in raw:
             raise ConfigError(f"Missing required config section: {section}")
 
@@ -143,6 +191,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
     database = DatabaseConfig(path=db_path)
+    conversion = _load_conversion(raw["conversion"])
     anthropic_cfg = AnthropicConfig(
         model=_require(raw["anthropic"], "model", "anthropic"),
         effort=_require(raw["anthropic"], "effort", "anthropic"),
@@ -154,15 +203,68 @@ def load_config(path: Path | None = None) -> AppConfig:
     redaction = RedactionConfig(
         person=_require(raw["redaction"], "person", "redaction"),
         company=_require(raw["redaction"], "company", "redaction"),
+        email=_require(raw["redaction"], "email", "redaction"),
+        url=_require(raw["redaction"], "url", "redaction"),
     )
     synthetic = _load_synthetic(raw["synthetic"])
     return AppConfig(
         chunking=chunking,
         database=database,
+        conversion=conversion,
         anthropic=anthropic_cfg,
         redaction=redaction,
         synthetic=synthetic,
     )
+
+
+def _load_conversion(raw: dict) -> ConversionConfig:
+    """Build the conversion section.
+
+    The key must be present - an absent one would silently decide that no
+    service is in use - but an empty value is a legitimate answer meaning
+    exactly that.
+    """
+    service_url = _require(raw, "service_url", "conversion")
+    if not isinstance(service_url, str):
+        raise ConfigError(
+            f"Config key conversion.service_url must be a string, "
+            f"got {type(service_url).__name__}"
+        )
+    return ConversionConfig(service_url=service_url.strip())
+
+
+def _load_catalog(raw: object) -> tuple[LLMCatalogEntry, ...]:
+    """Build the offered-model catalog, failing fast on any missing field.
+
+    An entry short of a field would render as a blank figure in the settings
+    view, which is worse than not offering the model at all.
+    """
+    if not isinstance(raw, list):
+        raise ConfigError(
+            f"Config key synthetic.llm.catalog must be a list, got {type(raw).__name__}"
+        )
+    entries = []
+    for index, item in enumerate(raw):
+        section_name = f"synthetic.llm.catalog[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(
+                f"Config key {section_name} must be an object, "
+                f"got {type(item).__name__}"
+            )
+        entries.append(
+            LLMCatalogEntry(
+                model=_require(item, "model", section_name),
+                size=_require(item, "size", section_name),
+                seconds_per_fragment=float(
+                    _require(item, "seconds_per_fragment", section_name)
+                ),
+                first_try_validity=float(
+                    _require(item, "first_try_validity", section_name)
+                ),
+                note=_require(item, "note", section_name),
+            )
+        )
+    return tuple(entries)
 
 
 def _load_synthetic(raw: dict) -> SyntheticConfig:
@@ -178,6 +280,8 @@ def _load_synthetic(raw: dict) -> SyntheticConfig:
         model=_require(raw_llm, "model", "synthetic.llm"),
         temperature=float(_require(raw_llm, "temperature", "synthetic.llm")),
         timeout_seconds=float(_require(raw_llm, "timeout_seconds", "synthetic.llm")),
+        catalog=_load_catalog(_require(raw_llm, "catalog", "synthetic.llm")),
+        catalog_note=_require(raw_llm, "catalog_note", "synthetic.llm"),
     )
     return SyntheticConfig(
         honeytokens_enabled=_require_bool(raw, "honeytokens_enabled", "synthetic"),

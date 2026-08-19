@@ -22,7 +22,9 @@ from doc_quant.config import (
     AppConfig,
     ChunkingConfig,
     ConfigError,
+    ConversionConfig,
     DatabaseConfig,
+    LLMCatalogEntry,
     RedactionConfig,
     SyntheticConfig,
     SyntheticLLMConfig,
@@ -45,6 +47,19 @@ MODEL = "test-model"
 SEED = 20260818
 
 STUBBORN_OUTPUT = "The parties agreed to revisit the matter at a later date."
+
+# The offered-model catalog the settings view renders; irrelevant to generation
+# itself, so one entry is enough here.
+CATALOG = (
+    LLMCatalogEntry(
+        model=MODEL,
+        size="1.0 GB",
+        seconds_per_fragment=0.9,
+        first_try_validity=0.81,
+        note="test entry",
+    ),
+)
+CATALOG_NOTE = "Measured on a test machine."
 
 
 # ----------------------------------------------------------------------
@@ -69,6 +84,8 @@ def make_config(tmp_path: Path, **synthetic_overrides) -> AppConfig:
             model=MODEL,
             temperature=0.8,
             timeout_seconds=5.0,
+            catalog=CATALOG,
+            catalog_note=CATALOG_NOTE,
         ),
     )
     return AppConfig(
@@ -78,10 +95,16 @@ def make_config(tmp_path: Path, **synthetic_overrides) -> AppConfig:
             name_run_max_extension_tokens=12,
         ),
         database=DatabaseConfig(path=tmp_path / "chunks.db"),
+        conversion=ConversionConfig(service_url=""),
         anthropic=AnthropicConfig(
             model="claude-opus-5", effort="low", max_tokens=1024, detect_concurrency=6
         ),
-        redaction=RedactionConfig(person="**PERSON**", company="**COMPANY**"),
+        redaction=RedactionConfig(
+            person="**PERSON**",
+            company="**COMPANY**",
+            email="**EMAIL**",
+            url="**URL**",
+        ),
         synthetic=replace(synthetic, **synthetic_overrides),
     )
 
@@ -171,12 +194,18 @@ def test_missing_synthetic_section_fails_fast(tmp_path: Path) -> None:
                     "name_run_max_extension_tokens": 12,
                 },
                 "database": {"path": "data/chunks.db"},
+                "conversion": {"service_url": ""},
                 "anthropic": {
                     "model": "claude-opus-5",
                     "effort": "low",
                     "max_tokens": 1024,
                 },
-                "redaction": {"person": "**PERSON**", "company": "**COMPANY**"},
+                "redaction": {
+                    "person": "**PERSON**",
+                    "company": "**COMPANY**",
+                    "email": "**EMAIL**",
+                    "url": "**URL**",
+                },
             }
         ),
         encoding="utf-8",
@@ -203,6 +232,94 @@ def test_missing_llm_key_fails_fast(tmp_path: Path) -> None:
     config_path.write_text(json.dumps(raw), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="synthetic.llm.base_url"):
+        load_config(config_path)
+
+
+def test_conversion_defaults_to_the_built_in_converter() -> None:
+    # An empty service_url means the optional external service is not in use.
+    assert load_config(DEFAULT_CONFIG_PATH).conversion.service_url == ""
+
+
+def test_conversion_service_url_is_read_and_trimmed(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["conversion"]["service_url"] = "  http://converter:9000  "
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert load_config(config_path).conversion.service_url == "http://converter:9000"
+
+
+def test_missing_conversion_section_fails_fast(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    del raw["conversion"]
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="conversion"):
+        load_config(config_path)
+
+
+def test_missing_conversion_service_url_fails_fast(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    del raw["conversion"]["service_url"]
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="conversion.service_url"):
+        load_config(config_path)
+
+
+def test_non_string_conversion_service_url_fails_fast(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["conversion"]["service_url"] = 9000
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="must be a string"):
+        load_config(config_path)
+
+
+def test_llm_catalog_is_loaded_with_every_measured_field(tmp_path: Path) -> None:
+    config = load_config(DEFAULT_CONFIG_PATH)
+
+    catalog = config.synthetic.llm.catalog
+    assert len(catalog) >= 1
+    assert config.synthetic.llm.catalog_note
+    for entry in catalog:
+        assert entry.model and entry.size and entry.note
+        assert entry.seconds_per_fragment > 0
+        assert 0.0 <= entry.first_try_validity <= 1.0
+    # The configured default model is one a user can also pick from the list.
+    assert config.synthetic.llm.model in [entry.model for entry in catalog]
+
+
+def test_catalog_entry_missing_a_field_fails_fast(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    del raw["synthetic"]["llm"]["catalog"][1]["first_try_validity"]
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"synthetic.llm.catalog\[1\].first_try_validity"):
+        load_config(config_path)
+
+
+def test_catalog_that_is_not_a_list_fails_fast(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["synthetic"]["llm"]["catalog"] = {"model": "llama3.2:1b"}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="must be a list"):
+        load_config(config_path)
+
+
+def test_missing_catalog_note_fails_fast(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    del raw["synthetic"]["llm"]["catalog_note"]
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="synthetic.llm.catalog_note"):
         load_config(config_path)
 
 
@@ -576,6 +693,8 @@ def test_the_llm_client_is_built_lazily(tmp_path: Path, store: ChunkStore) -> No
         model=MODEL,
         temperature=0.8,
         timeout_seconds=0.1,
+        catalog=CATALOG,
+        catalog_note=CATALOG_NOTE,
     ))
     generator = SyntheticGenerator(config, store)
 
@@ -598,6 +717,8 @@ def test_disabled_llm_uses_templates_directly(tmp_path: Path, store: ChunkStore)
         model=MODEL,
         temperature=0.8,
         timeout_seconds=0.1,
+        catalog=CATALOG,
+        catalog_note=CATALOG_NOTE,
     ))
     generator = SyntheticGenerator(config, store, llm=_ExplodingLLM())
 

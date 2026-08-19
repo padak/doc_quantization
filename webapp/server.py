@@ -52,14 +52,20 @@ from pydantic import BaseModel
 
 from doc_quant.chunker import Chunker
 from doc_quant.cli import run_canary_probe
-from doc_quant.config import PROJECT_ROOT, AppConfig, ConfigError, load_config
+from doc_quant.config import (
+    PROJECT_ROOT,
+    AppConfig,
+    ConfigError,
+    ConversionConfig,
+    load_config,
+)
 from doc_quant.detector import (
     DETECTION_SYSTEM_PROMPT,
     ENTITY_SCHEMA,
     parse_entities,
     plan_synthetic_fragments,
 )
-from doc_quant.redactor import redact_text
+from doc_quant.redactor import EMAIL, URL, find_emails, find_urls, redact_text
 from doc_quant.store import ChunkStore
 from doc_quant.synthetic import (
     KIND_CANARY,
@@ -96,6 +102,17 @@ _LOG_HANDLER_MARKER = "doc_quant_webapp"
 # converter would only risk mangling what the user wrote.
 RAW_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
 UPLOAD_STEM = "upload"
+
+# The optional external conversion service (see `conversion` in
+# config/config.json): one endpoint that takes a file and answers with
+# Markdown, and one that says whether it is up.
+CONVERT_PATH = "/convert"
+HEALTH_PATH = "/health"
+CONVERT_FILE_FIELD = "file"
+CONVERT_MARKDOWN_FIELD = "markdown"
+# Converting a large PDF well takes time; this is not the preflight's timeout.
+CONVERT_TIMEOUT_SECONDS = 120.0
+CONVERSION_BUILTIN_DETAIL = "built-in markitdown (no conversion service configured)"
 FALLBACK_UPLOAD_NAME = "upload"
 
 # A synchronous run is still recorded as a batch so that honeytoken results and
@@ -138,11 +155,13 @@ CHECK_ANTHROPIC = "anthropic"
 CHECK_LOCAL_LLM = "local_llm"
 CHECK_MARKITDOWN = "markitdown"
 CHECK_DATABASE = "database"
+CHECK_CONVERSION = "conversion"
 CHECK_LABELS = {
     CHECK_ANTHROPIC: "Anthropic API",
     CHECK_LOCAL_LLM: "Local LLM",
     CHECK_MARKITDOWN: "Document conversion",
     CHECK_DATABASE: "Database",
+    CHECK_CONVERSION: "Conversion service",
 }
 VERIFY_NO_KEY_DETAIL = (
     "No Anthropic API key stored: add one in Settings (or set the "
@@ -163,6 +182,7 @@ HTTP_BAD_REQUEST = 400
 HTTP_NOT_FOUND = 404
 HTTP_CONFLICT = 409
 HTTP_UNPROCESSABLE = 422
+HTTP_BAD_GATEWAY = 502
 
 
 def configure_logging() -> None:
@@ -237,13 +257,15 @@ def get_markitdown() -> Any:
     return MarkItDown()
 
 
-def get_http_client() -> Any:
-    """Build the HTTP client used to reach the local LLM endpoint.
+def get_http_client(timeout: float = VERIFY_HTTP_TIMEOUT_SECONDS) -> Any:
+    """Build the HTTP client used to reach the local side services.
 
-    Separate from `doc_quant.synthetic`'s own client: this one only ever asks a
-    server what it can do, and must give up quickly when nothing answers.
+    Separate from `doc_quant.synthetic`'s own client. The default timeout is
+    the preflight's: it only asks a server what it can do and must give up
+    quickly when nothing answers. Converting a document is the other kind of
+    call, and passes its own, far longer, timeout.
     """
-    return httpx.Client(timeout=VERIFY_HTTP_TIMEOUT_SECONDS)
+    return httpx.Client(timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +435,7 @@ def upload_document(
 ) -> dict:
     """Convert an uploaded file to Markdown, chunk it and store it."""
     filename = file.filename or FALLBACK_UPLOAD_NAME
-    markdown = _to_markdown(filename, file.file.read())
+    markdown = _to_markdown(filename, file.file.read(), context.config.conversion)
     if not markdown.strip():
         raise HTTPException(
             status_code=HTTP_UNPROCESSABLE,
@@ -460,7 +482,13 @@ def read_redaction(
     context: RequestContext = Depends(context_dependency),
     store: ChunkStore = Depends(store_dependency),
 ) -> dict:
-    """Return the document before and after placeholder substitution."""
+    """Return the document before and after placeholder substitution.
+
+    Email addresses and URLs are not in the entities table - they are never
+    sent to the detector - so they are found on the original here and reported
+    alongside the stored entities, which is how the view can show what was
+    removed.
+    """
     _require_document(store, doc_id)
     original = store.reconstruct(doc_id)
     entities = store.get_document_entities(doc_id)
@@ -469,22 +497,36 @@ def read_redaction(
         entities,
         context.config.redaction.person,
         context.config.redaction.company,
+        email_placeholder=context.config.redaction.email,
+        url_placeholder=context.config.redaction.url,
     )
+    payloads = _entity_payloads(entities)
+    known = {payload["text"] for payload in payloads}
+    for found, entity_type in ((find_emails(original), EMAIL), (find_urls(original), URL)):
+        payloads.extend(
+            {"text": text, "type": entity_type}
+            for text in found
+            if text not in known
+        )
+        known.update(found)
     return {
         "original": original,
         "redacted": redacted,
-        "entities": _entity_payloads(entities),
+        "entities": payloads,
     }
 
 
-def _to_markdown(filename: str, raw: bytes) -> str:
+def _to_markdown(
+    filename: str, raw: bytes, conversion: ConversionConfig | None = None
+) -> str:
     """Convert uploaded bytes to Markdown.
 
-    Text formats are taken verbatim: they are already what the pipeline wants,
-    and a round trip through a converter could only alter them. Everything else
-    goes through markitdown, which needs a real file, so the bytes are written
-    to a temporary one carrying the original suffix - that suffix is how the
-    converter picks its reader.
+    Text formats are taken verbatim and always locally: they are already what
+    the pipeline wants, and a round trip through any converter could only alter
+    them. Everything else goes to the external conversion service when one is
+    configured, and otherwise through markitdown, which needs a real file, so
+    the bytes are written to a temporary one carrying the original suffix -
+    that suffix is how the converter picks its reader.
     """
     suffix = Path(filename).suffix
     if suffix.lower() in RAW_TEXT_SUFFIXES:
@@ -495,6 +537,9 @@ def _to_markdown(filename: str, raw: bytes) -> str:
                 status_code=HTTP_UNPROCESSABLE,
                 detail=f"{filename} is not valid UTF-8 text: {exc}",
             ) from exc
+
+    if conversion is not None and conversion.service_url:
+        return _convert_via_service(filename, raw, conversion.service_url)
 
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / f"{UPLOAD_STEM}{suffix}"
@@ -523,6 +568,56 @@ def _to_markdown(filename: str, raw: bytes) -> str:
             detail=f"Conversion of {filename} returned no text",
         )
     return text
+
+
+def _convert_via_service(filename: str, raw: bytes, service_url: str) -> str:
+    """Hand the file to the external conversion service and read its Markdown.
+
+    A service that was configured but cannot be reached is a 502 rather than a
+    silent fallback to the built-in converter: the user asked for the better
+    conversion, and quietly giving them the worse one would be indistinguishable
+    from it working.
+    """
+    url = f"{service_url.rstrip('/')}{CONVERT_PATH}"
+    try:
+        client = get_http_client(CONVERT_TIMEOUT_SECONDS)
+        try:
+            response = client.post(url, files={CONVERT_FILE_FIELD: (filename, raw)})
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - any transport failure is the same answer
+        logger.warning("Conversion service unreachable at %s: %s", url, exc)
+        raise HTTPException(
+            status_code=HTTP_BAD_GATEWAY,
+            detail=f"Conversion service unreachable at {url}: {_readable(exc)}",
+        ) from exc
+
+    status_code = getattr(response, "status_code", None)
+    if status_code != 200:
+        logger.warning("Conversion service at %s answered HTTP %s", url, status_code)
+        raise HTTPException(
+            status_code=HTTP_BAD_GATEWAY,
+            detail=(
+                f"Conversion service at {url} answered HTTP {status_code} "
+                f"for {filename}"
+            ),
+        )
+
+    try:
+        markdown = response.json()[CONVERT_MARKDOWN_FIELD]
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning("Conversion service at %s returned an unexpected payload: %s", url, exc)
+        raise HTTPException(
+            status_code=HTTP_BAD_GATEWAY,
+            detail=f"Conversion service at {url} returned an unexpected payload: {exc}",
+        ) from exc
+
+    if not isinstance(markdown, str):
+        raise HTTPException(
+            status_code=HTTP_BAD_GATEWAY,
+            detail=f"Conversion service at {url} returned no text for {filename}",
+        )
+    return markdown
 
 
 def _chunk_payloads(
@@ -1006,6 +1101,60 @@ def synthetic_report(store: ChunkStore = Depends(store_dependency)) -> dict:
     }
 
 
+@app.get("/api/llm-models")
+def llm_models(context: RequestContext = Depends(context_dependency)) -> dict:
+    """Offer the catalogued local models, saying which are actually installed.
+
+    The catalog is config data (measured figures, not promises); availability
+    is asked of the local server right here, because a model listed but not
+    pulled is the difference between a choice and a broken run. An unreachable
+    endpoint is a normal answer - no model is available - rather than an error:
+    the deterministic templates remain a valid choice either way.
+    """
+    llm = context.config.synthetic.llm
+    available, reachable = _local_models(llm.base_url)
+    return {
+        "catalog": [
+            {
+                "model": entry.model,
+                "size": entry.size,
+                "seconds_per_fragment": entry.seconds_per_fragment,
+                "first_try_validity": entry.first_try_validity,
+                "note": entry.note,
+                "available": _serves_model(entry.model, available),
+            }
+            for entry in llm.catalog
+        ],
+        "catalog_note": llm.catalog_note,
+        "available": available,
+        "llm_reachable": reachable,
+    }
+
+
+def _local_models(base_url: str) -> tuple[list[str], bool]:
+    """Ask the local endpoint what it serves; ([], False) when it does not answer."""
+    url = f"{base_url.rstrip('/')}{MODELS_PATH}"
+    try:
+        client = get_http_client()
+        try:
+            response = client.get(url)
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - unreachable is a normal outcome
+        logger.info("Local LLM unreachable at %s: %s", url, exc)
+        return [], False
+
+    if getattr(response, "status_code", None) != 200:
+        logger.info("Local LLM at %s answered HTTP %s", url, getattr(response, "status_code", None))
+        return [], False
+
+    try:
+        return [item["id"] for item in response.json()["data"]], True
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning("Local LLM at %s returned an unexpected payload: %s", url, exc)
+        return [], False
+
+
 @app.post("/api/verify")
 def verify(context: RequestContext = Depends(context_dependency)) -> dict:
     """Check every external dependency the pipeline needs before a run.
@@ -1018,6 +1167,7 @@ def verify(context: RequestContext = Depends(context_dependency)) -> dict:
         _check_anthropic(context),
         _check_local_llm(context.config),
         _check_markitdown(),
+        _check_conversion_service(context.config),
         _check_database(context.config),
     ]
     all_ok = all(check["ok"] for check in checks)
@@ -1146,6 +1296,58 @@ def _check_markitdown() -> dict:
         f"converted a sample document to {len(markdown)} characters of markdown",
         started,
     )
+
+
+def _check_conversion_service(config: AppConfig) -> dict:
+    """Confirm the external conversion service answers, when one is configured.
+
+    With no service configured the check passes: the built-in converter is a
+    complete answer, and a feature deliberately not in use must not report the
+    environment as broken.
+    """
+    started = time.perf_counter()
+    service_url = config.conversion.service_url
+    if not service_url:
+        return _check(CHECK_CONVERSION, True, CONVERSION_BUILTIN_DETAIL, started)
+
+    url = f"{service_url.rstrip('/')}{HEALTH_PATH}"
+    hint = (
+        "start the conversion service, or clear conversion.service_url to use "
+        "the built-in markitdown converter"
+    )
+    try:
+        client = get_http_client()
+        try:
+            response = client.get(url)
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
+        logger.warning("Preflight: conversion service unreachable at %s: %s", url, exc)
+        return _check(
+            CHECK_CONVERSION, False, f"{url} unreachable ({exc}); {hint}", started
+        )
+
+    status_code = getattr(response, "status_code", None)
+    if status_code != 200:
+        return _check(
+            CHECK_CONVERSION,
+            False,
+            f"{url} answered HTTP {status_code}; {hint}",
+            started,
+        )
+    return _check(CHECK_CONVERSION, True, f"{url}: {_health_detail(response)}", started)
+
+
+def _health_detail(response: Any) -> str:
+    """Render whatever the health endpoint said about itself."""
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        text = getattr(response, "text", "")
+        return str(text).strip() or "ok"
+    if isinstance(body, dict):
+        return ", ".join(f"{key}={value}" for key, value in body.items()) or "ok"
+    return str(body)
 
 
 def _check_database(config: AppConfig) -> dict:

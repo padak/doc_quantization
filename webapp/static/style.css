@@ -40,6 +40,13 @@
   --canary-bg:       #F1EAFD;
   --canary-line:     #DCCCFA;
 
+  /* email and url — regex-detected, so hues of their own, apart from
+     person/company and from each other */
+  --email:           #0E7490;
+  --email-bg:        #E1F2F5;
+  --url:             #7A6A2F;
+  --url-bg:          #F2EEDD;
+
   /* run status — deliberately different hues AND different shapes than kinds */
   --ok:          #15803D;
   --ok-bg:       #E6F4EA;
@@ -704,6 +711,20 @@ a:hover { color: var(--accent-strong); }
 .copy-id:hover { color: var(--accent); border-bottom-style: solid; }
 .copy-id.copied { color: var(--ok); border-bottom-color: var(--ok-line); }
 
+/* An id that is context, not the point of the row: present but quiet. */
+.id-cell .copy-id { color: var(--ink-3); border-bottom-color: var(--line-strong); }
+.id-cell .copy-id:hover { color: var(--accent); }
+
+/* A path is worth reading, but must not push the measurements off-screen. */
+.doc-cell {
+  display: inline-block;
+  max-width: 26ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 /* ---------------------------------------------------------------- stats */
 
 .stat-row {
@@ -1245,6 +1266,8 @@ a:hover { color: var(--accent-strong); }
 
 .ent-type-person { background: var(--real-bg); color: var(--real); }
 .ent-type-company { background: var(--canary-bg); color: var(--canary); }
+.ent-type-email { background: var(--email-bg); color: var(--email); }
+.ent-type-url { background: var(--url-bg); color: var(--url); }
 .ent-type-other { background: var(--paper-3); color: var(--ink-2); }
 
 /* ------------------------------------------------------------- redaction */
@@ -1432,6 +1455,83 @@ mark.redacted {
 }
 
 .hint { font-size: 12px; color: var(--ink-3); margin-top: 5px; }
+.hint.small { font-size: 11px; font-style: italic; }
+
+/* ------------------------------------------- synthetic generator picker */
+
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border: 1px solid var(--line-strong);
+  background: var(--card);
+  border-radius: var(--r-md);
+  padding: 10px 11px;
+  margin-bottom: 0;
+  cursor: pointer;
+  font-weight: 400;
+}
+
+.choice:hover { border-color: var(--accent-line); }
+
+.choice.is-picked {
+  border-color: var(--accent);
+  background: var(--accent-bg, var(--card-2));
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* An unpulled model stays readable — the user has to see what to pull. */
+.choice.is-disabled { cursor: not-allowed; opacity: 0.62; }
+.choice.is-disabled:hover { border-color: var(--line-strong); }
+
+.choice input[type="radio"] {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.choice-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+
+.choice-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+.choice-title {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.choice-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+
+.choice-stat {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}
+
+.choice-sub { font-size: 12px; color: var(--ink-3); }
+
+.choice-chip {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.choice-chip-ok { background: var(--ok-bg); color: var(--ok); }
+.choice-chip-off { background: var(--paper-3); color: var(--ink-2); }
 
 /* ---------------------------------------------------------------- verify */
 
