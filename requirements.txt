@@ -5,6 +5,7 @@
 # Verified on Python 3.9, 3.11, 3.13 and 3.14.
 anthropic>=0.40
 httpx>=0.27
+python-dotenv>=1.0
 tiktoken>=0.7
 
 # Development
