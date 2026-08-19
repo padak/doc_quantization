@@ -2029,6 +2029,134 @@ def test_llm_models_follows_the_configured_base_url_override(harness):
 
 
 # ---------------------------------------------------------------------------
+# local detection models
+# ---------------------------------------------------------------------------
+
+
+def local_detection_models(harness: Harness, base_url: str | None = None) -> dict:
+    """Ask the endpoint what the local detection server serves."""
+    path = "/api/detection/local-models"
+    if base_url is not None:
+        path += f"?base_url={base_url}"
+    response = harness.client.get(path)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_local_detection_models_lists_the_served_ids_sorted(harness):
+    config = load_config()
+    harness.http.serve(["qwen2.5:7b", "gemma3:4b", "llama3.2:1b"])
+
+    payload = local_detection_models(harness)
+
+    # Sorted, because the field they feed is a picker: the order the server
+    # happens to answer in is not a ranking the user should have to read.
+    assert payload["models"] == ["gemma3:4b", "llama3.2:1b", "qwen2.5:7b"]
+    assert "detail" not in payload
+    assert harness.http.requested == [f"{config.detection.local.base_url}/models"]
+
+
+def test_local_detection_models_honours_the_base_url_query_parameter(harness):
+    harness.http.serve(["typed-model"])
+
+    payload = local_detection_models(harness, base_url="http://typed:9999/v1/")
+
+    # The parameter is what lets the settings form list models for a URL the
+    # user has typed but not saved yet.
+    assert payload["models"] == ["typed-model"]
+    assert harness.http.requested == ["http://typed:9999/v1/models"]
+
+
+def test_local_detection_models_follows_the_saved_base_url_override(harness):
+    harness.client.put(
+        "/api/settings", json={"detection_local_base_url": "http://saved:1234/v1"}
+    )
+    harness.http.requested.clear()
+    harness.http.serve(["saved-model"])
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == ["saved-model"]
+    assert harness.http.requested == ["http://saved:1234/v1/models"]
+
+
+def test_local_detection_models_reports_an_unreachable_server_without_failing(harness):
+    harness.http.error = httpx.ConnectError("connection refused")
+
+    payload = local_detection_models(harness)
+
+    # A server that does not answer while the user is still typing its URL is
+    # a normal state the picker degrades through, not an error worth a status.
+    assert payload["models"] == []
+    assert "connection refused" in payload["detail"]
+
+
+def test_local_detection_models_reports_an_error_response_without_failing(harness):
+    harness.http.serve([], status_code=503)
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == []
+    assert "503" in payload["detail"]
+
+
+def test_local_detection_models_survives_an_unparsable_payload(harness):
+    harness.http.error = None
+    harness.http.response = SimpleNamespace(
+        status_code=200, json=lambda: {"models": ["not-the-openai-shape"]}
+    )
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == []
+    assert payload["detail"]
+
+
+def test_local_detection_models_skips_entries_without_a_string_id(harness):
+    harness.http.error = None
+    harness.http.response = SimpleNamespace(
+        status_code=200,
+        json=lambda: {
+            "data": [
+                {"id": "good-model"},
+                {"id": 17},
+                {"object": "model"},
+                "not-a-dict",
+                {"id": ""},
+            ]
+        },
+    )
+
+    payload = local_detection_models(harness)
+
+    # An odd entry costs its own id, never the whole list: half a picker still
+    # beats none.
+    assert payload["models"] == ["good-model"]
+
+
+def test_local_detection_models_needs_no_store(harness, monkeypatch):
+    def unusable(config) -> None:
+        raise AssertionError("the models endpoint must not touch the store")
+
+    monkeypatch.setattr(server, "get_store", unusable)
+    harness.http.serve(["qwen2.5:7b"])
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == ["qwen2.5:7b"]
+
+
+def test_local_detection_models_uses_the_short_preflight_timeout(harness):
+    harness.http.timeouts.clear()
+    harness.http.serve(["qwen2.5:7b"])
+
+    local_detection_models(harness)
+
+    # A typing-time affordance must never hang on the detection timeout.
+    assert harness.http.timeouts == [server.VERIFY_HTTP_TIMEOUT_SECONDS]
+
+
+# ---------------------------------------------------------------------------
 # canary probe
 # ---------------------------------------------------------------------------
 

@@ -1550,6 +1550,65 @@ def _local_models(base_url: str) -> tuple[list[str], bool]:
         return [], False
 
 
+@app.get("/api/detection/local-models")
+def local_detection_models(
+    base_url: str | None = None,
+    context: RequestContext = Depends(context_dependency),
+) -> dict:
+    """Offer the model ids the local detection server actually serves.
+
+    The model field is free text because a local server may serve anything,
+    but "anything" is precisely what a user cannot guess: the id has to match
+    the server's own spelling, tag included. So the field gets a list to pick
+    from, taken from the server itself rather than from a catalog we maintain.
+
+    `base_url` overrides the configured endpoint, because the settings form
+    needs to list models for a URL the user has typed but not yet saved -
+    listing the old endpoint's models next to a new URL would be a lie.
+
+    A server that does not answer is a normal state here, not a failure: the
+    user is very likely mid-typing. Hence HTTP 200 with an empty list and a
+    one-line reason, deliberately unlike /api/detect's 503 - there nothing
+    can proceed, here the field simply stays free text as it is today.
+    """
+    endpoint = (base_url or context.config.detection.local.base_url).rstrip("/")
+    url = f"{endpoint}{MODELS_PATH}"
+
+    try:
+        client = get_http_client()
+        try:
+            response = client.get(url)
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - unreachable is a normal outcome
+        logger.info("Local detection endpoint unreachable at %s: %s", url, exc)
+        return {"models": [], "detail": f"{url} unreachable ({_readable(exc)})"}
+
+    status_code = getattr(response, "status_code", None)
+    if status_code != 200:
+        logger.info("Local detection endpoint %s answered HTTP %s", url, status_code)
+        return {"models": [], "detail": f"{url} answered HTTP {status_code}"}
+
+    try:
+        entries = response.json()["data"]
+        if not isinstance(entries, list):
+            raise TypeError(f"data is {type(entries).__name__}, not a list")
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.info("Local detection endpoint %s returned an odd payload: %s", url, exc)
+        return {"models": [], "detail": f"{url} returned an unexpected payload ({exc})"}
+
+    # One malformed entry costs its own id and nothing else: a partial list is
+    # still a usable picker, while raising would leave the user with none.
+    model_ids = {
+        entry["id"]
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and entry["id"].strip()
+    }
+    return {"models": sorted(model_ids)}
+
+
 @app.post("/api/verify")
 def verify(context: RequestContext = Depends(context_dependency)) -> dict:
     """Check every external dependency the pipeline needs before a run.

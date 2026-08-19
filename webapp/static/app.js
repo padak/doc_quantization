@@ -152,6 +152,10 @@
     probePlanned: null,      // how many probe calls the running probe is making
     llmModels: null,         // GET /api/llm-models payload
     llmChoice: null,         // picked prose generator, null until the user picks
+    // Model ids a local server says it serves, keyed by the base URL it was
+    // asked at: the detection field and the synthetic-generator field may point
+    // at different servers, so a single global list would offer the wrong ids.
+    localModels: {},         // baseUrl -> [id, ...] (or [] when it did not answer)
     verify: null,            // POST /api/verify payload
     verifyError: null,       // why the check itself could not run
     verifyAuto: false,
@@ -2498,6 +2502,71 @@
     return html;
   }
 
+  // The two datalists that turn a "type the exact model id" field into a
+  // picker. Ids, not classes: an <input list="..."> can only name one.
+  const DETECTION_MODEL_OPTIONS = 'detection-model-options';
+  const LLM_MODEL_OPTIONS = 'llm-model-options';
+
+  /** An empty (or already known) datalist for a model field.
+   *
+   * Rendered from the cache so the suggestions survive a re-render; when the
+   * base URL has not been asked yet the list starts empty and is filled in
+   * place by `refreshModelOptions`, which never re-renders the form — a user
+   * halfway through editing another field must not lose what they typed.
+   */
+  function modelOptionsHtml(listId, baseUrl) {
+    const known = safeArray(store.localModels[modelCacheKey(baseUrl)]);
+    let html = '<datalist id="' + listId + '">';
+    known.forEach((model) => {
+      html += '<option value="' + esc(model) + '"></option>';
+    });
+    html += '</datalist>';
+    return html;
+  }
+
+  /** Cache key for one endpoint: an empty field means "whatever is configured". */
+  function modelCacheKey(baseUrl) {
+    return (baseUrl || '').trim();
+  }
+
+  /** Fill both model datalists from the base URLs currently in the form. */
+  function refreshModelOptions(root) {
+    refreshModelOptionsFor(root, DETECTION_MODEL_OPTIONS, '#f-detection-base');
+    refreshModelOptionsFor(root, LLM_MODEL_OPTIONS, '#f-base');
+  }
+
+  /** Ask the server at `baseSelector`'s URL what it serves, then fill `listId`.
+   *
+   * Silent by design: this is an affordance, not a check. A server that does
+   * not answer (very likely while its URL is still being typed) leaves the
+   * list empty and the field behaves exactly as it did before — the preflight
+   * on the same page is where an unreachable endpoint is actually reported.
+   */
+  async function refreshModelOptionsFor(root, listId, baseSelector) {
+    const baseNode = root.querySelector(baseSelector);
+    const key = modelCacheKey(baseNode ? baseNode.value : '');
+    if (!(key in store.localModels)) {
+      let payload = null;
+      try {
+        payload = await api('/api/detection/local-models' +
+          (key ? '?base_url=' + encodeURIComponent(key) : ''));
+      } catch (err) {
+        payload = null;
+      }
+      store.localModels[key] = safeArray(payload && payload.models);
+    }
+    fillModelOptions(root, listId, store.localModels[key]);
+  }
+
+  /** Write the offered ids into an already-rendered datalist. */
+  function fillModelOptions(root, listId, models) {
+    const list = root.querySelector('#' + listId);
+    if (!list) return;
+    list.innerHTML = safeArray(models)
+      .map((model) => '<option value="' + esc(model) + '"></option>')
+      .join('');
+  }
+
   /** The "Synthetic prose generator" picker: templates, catalogued models, custom. */
   function generatorChoiceHtml(settings) {
     const data = store.llmModels;
@@ -2544,8 +2613,10 @@
     html += '<div class="field" id="llm-custom-field"' +
       (choice === CHOICE_CUSTOM ? '' : ' hidden') + ' style="margin-top:10px">';
     html += '<label for="f-llm-model">Custom local model</label>';
-    html += '<input type="text" id="f-llm-model" name="llm_model" value="' +
-      esc(settings.llm_model || '') + '" placeholder="model id as the local server names it">';
+    html += '<input type="text" id="f-llm-model" name="llm_model" list="' + LLM_MODEL_OPTIONS +
+      '" value="' + esc(settings.llm_model || '') +
+      '" placeholder="model id as the local server names it">';
+    html += modelOptionsHtml(LLM_MODEL_OPTIONS, settings.llm_base_url);
     html += '</div>';
 
     html += '</div>';
@@ -2684,9 +2755,15 @@
       '" placeholder="OpenAI-compatible endpoint of the local server"></div>';
 
     html += '<div class="field"><label for="f-detection-model">Local detection model</label>';
-    html += '<input type="text" id="f-detection-model" name="detection_local_model" value="' +
+    html += '<input type="text" id="f-detection-model" name="detection_local_model" list="' +
+      DETECTION_MODEL_OPTIONS + '" value="' +
       esc(settings.detection_local_model || '') +
-      '" placeholder="model id as the local server names it"></div>';
+      '" placeholder="model id as the local server names it">';
+    // Suggestions only: the id has to match the server's own spelling, which
+    // nobody can guess, but a server may serve models it does not list, so the
+    // field stays free text.
+    html += modelOptionsHtml(DETECTION_MODEL_OPTIONS, settings.detection_local_base_url);
+    html += '</div>';
 
     return html;
   }
@@ -2745,6 +2822,21 @@
   function wireSettings(root) {
     const verify = root.querySelector('#run-verify');
     if (verify) verify.addEventListener('click', () => runVerify());
+
+    // Offer the model ids the local servers actually serve, and follow the
+    // base URL fields: pointing at another server must re-ask that server,
+    // never re-offer the previous one's models. `change` (not `input`) so a
+    // half-typed URL is not asked about on every keystroke.
+    refreshModelOptions(root);
+    [
+      { base: '#f-detection-base', list: DETECTION_MODEL_OPTIONS },
+      { base: '#f-base', list: LLM_MODEL_OPTIONS },
+    ].forEach((pair) => {
+      const node = root.querySelector(pair.base);
+      if (node) {
+        node.addEventListener('change', () => refreshModelOptionsFor(root, pair.list, pair.base));
+      }
+    });
 
     const reload = root.querySelector('#reload-settings');
     if (reload) {
@@ -2894,6 +2986,9 @@
     // Configuration changed, so the previous verdict and the availability of
     // the offered models (the base URL may have moved) are both stale.
     store.llmModels = null;
+    // Same reason, plus the cheap way to re-ask a server that was down while
+    // the user was configuring it: save the form and the lists are asked again.
+    store.localModels = {};
     fetchLlmModels();
     runVerify();
   }
