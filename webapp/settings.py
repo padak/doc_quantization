@@ -5,7 +5,7 @@ the user changed in the web app. The two are combined into an ordinary
 `AppConfig`, so every module downstream keeps reading its tunables from one
 place and never has to know that an override existed.
 
-Overridable settings fall into four shapes, each validated and merged its own
+Overridable settings fall into five shapes, each validated and merged its own
 way:
 
 * free-text strings (`model`, `llm_base_url`, ...) - an empty value clears
@@ -15,7 +15,9 @@ way:
 * switches (see `BOOL_SETTINGS_KEYS`) - `True`/`False` are both stored
   decisions; there is no "empty" boolean;
 * numbers (see `NUMERIC_SETTINGS_SPECS`) - range-checked on both read and
-  write, and only `None` clears one; `0` is a legitimate stored value.
+  write, and only `None` clears one; `0` is a legitimate stored value;
+* enums (see `ENUM_SETTINGS_SPECS`) - free-text in shape, but the value has to
+  come from a fixed set, checked on both read and write.
 
 The Anthropic API key is the one setting that is not part of `AppConfig`: it is
 a secret, so it is carried separately, never written into any response, and
@@ -31,7 +33,12 @@ import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from doc_quant.config import PROJECT_ROOT, AppConfig, ConfigError
+from doc_quant.config import (
+    PROJECT_ROOT,
+    VALID_DETECTION_PROVIDERS,
+    AppConfig,
+    ConfigError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +90,27 @@ NUMERIC_SETTINGS_SPECS: dict[str, NumericSpec] = {
 }
 NUMERIC_SETTINGS_KEYS: tuple[str, ...] = tuple(NUMERIC_SETTINGS_SPECS)
 
+# String keys whose value must come from a fixed set. Validated on both read
+# and write, so a stored invalid value can never be discovered only later - a
+# settings file that names a backend nobody implements has to fail loudly at
+# the point it is read, not pick a backend by accident at detection time.
+ENUM_SETTINGS_SPECS: dict[str, frozenset] = {
+    "detection_provider": VALID_DETECTION_PROVIDERS,
+}
+ENUM_SETTINGS_KEYS: tuple[str, ...] = tuple(ENUM_SETTINGS_SPECS)
+
 SETTINGS_KEYS: tuple[str, ...] = (
     API_KEY_SETTING,
     "model",
     "effort",
     "llm_base_url",
     "llm_model",
+    "detection_local_base_url",
+    "detection_local_model",
     *PRESENCE_SETTINGS_KEYS,
     *BOOL_SETTINGS_KEYS,
     *NUMERIC_SETTINGS_KEYS,
+    *ENUM_SETTINGS_KEYS,
 )
 
 # A setting value is a string for the free-text fields, a real boolean for the
@@ -128,6 +147,26 @@ def _validate_numeric(key: str, value: object) -> int | float:
             f"Settings key {key} must be >= {spec.minimum}, got {number}"
         )
     return number
+
+
+def _validate_enum(key: str, value: object) -> str:
+    """Check an enum override against the set of values its key allows.
+
+    Same contract as `_validate_numeric`: read and write share this one check,
+    so a value the app would refuse to store cannot enter the settings file by
+    another route and be honoured on the next read.
+    """
+    allowed = ENUM_SETTINGS_SPECS[key]
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"Settings key {key} must be a string, got {type(value).__name__}"
+        )
+    if value not in allowed:
+        raise ConfigError(
+            f"Settings key {key} must be one of {sorted(allowed)}, got {value!r}"
+        )
+    return value
+
 
 # Structural constants of the mask, not tunables: how much of a key stays
 # readable so a user can tell which key is stored, and the elision between the
@@ -184,6 +223,13 @@ def load_overrides(path: Path) -> dict[str, SettingValue]:
                 )
             overrides[key] = value
             continue
+        if key in ENUM_SETTINGS_KEYS:
+            # An empty enum value is a cleared override like any other free-text
+            # key, so it is dropped rather than validated - "" is not a backend
+            # name and must not be reported as an illegal one.
+            if value != "":
+                overrides[key] = _validate_enum(key, value)
+            continue
         if not isinstance(value, str):
             raise ConfigError(
                 f"Settings key {key} must be a string, got {type(value).__name__}"
@@ -211,8 +257,9 @@ def save_overrides(
     cleared by the empty-string convention, only by sending None.
 
     Every numeric value is run through the same `NUMERIC_SETTINGS_SPECS` check
-    that `load_overrides` applies, so a value this function would refuse to
-    store can never be discovered invalid only later, when it is read back:
+    that `load_overrides` applies, and every enum value through the same
+    `ENUM_SETTINGS_SPECS` one, so a value this function would refuse to store
+    can never be discovered invalid only later, when it is read back:
     validation happens once, in one place, on both paths.
 
     Nothing is written to disk before every update in the batch has validated:
@@ -238,6 +285,8 @@ def save_overrides(
             merged.pop(key, None)
         elif key in NUMERIC_SETTINGS_KEYS:
             merged[key] = _validate_numeric(key, value)
+        elif key in ENUM_SETTINGS_KEYS:
+            merged[key] = _validate_enum(key, value)
         elif key in BOOL_SETTINGS_KEYS and not isinstance(value, bool):
             raise ConfigError(
                 f"Settings key {key} must be a boolean, got {type(value).__name__}"
@@ -280,6 +329,20 @@ def effective_config(config: AppConfig, overrides: dict[str, SettingValue]) -> A
         config.conversion,
         service_url=effective_conversion_service_url(config, overrides),
     )
+    # The local endpoint is patched whether or not the provider override picks
+    # it: a user may point the endpoint somewhere else while still on the
+    # remote backend, and that choice has to survive the switch.
+    detection_config = replace(
+        config.detection,
+        provider=_text(overrides, "detection_provider") or config.detection.provider,
+        local=replace(
+            config.detection.local,
+            base_url=_text(overrides, "detection_local_base_url")
+            or config.detection.local.base_url,
+            model=_text(overrides, "detection_local_model")
+            or config.detection.local.model,
+        ),
+    )
     chunking_config = replace(
         config.chunking,
         chunk_size_tokens=_number(
@@ -306,6 +369,7 @@ def effective_config(config: AppConfig, overrides: dict[str, SettingValue]) -> A
         anthropic=anthropic_config,
         conversion=conversion_config,
         synthetic=synthetic_config,
+        detection=detection_config,
     )
 
 
