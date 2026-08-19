@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>doc_quantization — observability console</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">dq</div>
+        <div class="brand-text">
+          <div class="brand-name">doc_quantization</div>
+          <div class="brand-sub">observability console</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Pipeline steps">
+        <a class="nav-item" href="#document" data-nav="document">
+          <span class="nav-step">1</span><span class="nav-label">Document</span>
+        </a>
+        <a class="nav-item" href="#chunks" data-nav="chunks">
+          <span class="nav-step">2</span><span class="nav-label">Chunks</span>
+        </a>
+        <a class="nav-item" href="#batch" data-nav="batch">
+          <span class="nav-step">3</span><span class="nav-label">Batch</span>
+        </a>
+        <a class="nav-item" href="#llm" data-nav="llm">
+          <span class="nav-step">4</span><span class="nav-label">LLM I/O</span>
+        </a>
+        <a class="nav-item" href="#redaction" data-nav="redaction">
+          <span class="nav-step">5</span><span class="nav-label">Redaction</span>
+        </a>
+        <a class="nav-item" href="#report" data-nav="report">
+          <span class="nav-step">6</span><span class="nav-label">Report</span>
+        </a>
+        <a class="nav-item" href="#settings" data-nav="settings">
+          <span class="nav-step">7</span><span class="nav-label">Settings</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="active-doc" id="active-doc">
+          <div class="active-doc-label">Active document</div>
+          <div class="active-doc-name" id="active-doc-name">none</div>
+          <div class="active-doc-id mono" id="active-doc-id"></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <section class="view" data-view="document" hidden></section>
+      <section class="view" data-view="chunks" hidden></section>
+      <section class="view" data-view="batch" hidden></section>
+      <section class="view" data-view="llm" hidden></section>
+      <section class="view" data-view="redaction" hidden></section>
+      <section class="view" data-view="report" hidden></section>
+      <section class="view" data-view="settings" hidden></section>
+    </main>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

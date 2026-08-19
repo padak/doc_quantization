@@ -2,10 +2,15 @@
 # compatible set is installed for whichever Python version is in use.
 # Do not replace this with `pip freeze` output: pinning transitive packages
 # to versions from one interpreter breaks installation on older ones.
-# Verified on Python 3.9, 3.11, 3.13 and 3.14.
 anthropic>=0.40
 httpx>=0.27
 tiktoken>=0.7
+
+# Observability web app
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
+markitdown[all]>=0.1
 
 # Development
 pytest>=8.0

@@ -101,6 +101,24 @@ class Chunker:
         """
         return self._encoding.encode(text, disallowed_special=())
 
+    def token_strings(self, text: str) -> list[str]:
+        """Decode every token of `text` on its own, for display purposes.
+
+        The list length is the token count, and for text whose characters each
+        live inside a single token the concatenation is `text` again. A
+        character split across two tokens cannot be shown that way, so the
+        pieces are decoded with `errors="replace"`: this output is only ever
+        shown to a reader, never stored and never sent anywhere, so a U+FFFD in
+        it costs nothing. Chunk text itself is produced by `chunk`, which is
+        lossless.
+        """
+        return [
+            self._encoding.decode_single_token_bytes(token).decode(
+                "utf-8", errors="replace"
+            )
+            for token in self._encode(text)
+        ]
+
     def chunk(self, text: str) -> list[str]:
         """Split `text` into consecutive chunks of roughly `chunk_size` tokens.
 
