@@ -126,14 +126,23 @@ def _synthetic_row_to_dict(row: sqlite3.Row) -> dict:
 class ChunkStore:
     """Persistent storage for chunked documents and their detection results."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, allow_cross_thread: bool = False) -> None:
         """Open (and if needed create) the SQLite database at `db_path`.
 
         Missing parent directories and missing tables are created.
+
+        `allow_cross_thread` drops sqlite3's same-thread guard. That is safe
+        only for a store whose calls never overlap in time - such as one scoped
+        to a single web request that a server's thread pool hands from thread
+        to thread sequentially. Keep the default (guard on) anywhere calls
+        could run concurrently; the guard is what enforces the write-on-one-
+        thread discipline in the parallel CLI flows.
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.db_path)
+        self._connection = sqlite3.connect(
+            self.db_path, check_same_thread=not allow_cross_thread
+        )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.executescript(_SCHEMA)

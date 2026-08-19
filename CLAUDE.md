@@ -55,7 +55,11 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
    inner word are skipped. Emails/URLs never need the LLM.
 7. **SQLite thread affinity.** In parallel flows (detect stream, canary
    probe) workers do API calls only; every store write happens on the
-   generator/calling thread via `as_completed`.
+   generator/calling thread via `as_completed`. The webapp's per-request
+   store is the one sanctioned exception: FastAPI hands a request's
+   dependency, endpoint and cleanup to different thread-pool workers
+   *sequentially*, so it opens with `allow_cross_thread=True`; everywhere
+   else the guard stays on (default) to keep catching real races.
 8. **Config discipline.** All tunables in `config/config.json`, fail-fast
    loaders (`_require`, `_require_bool` — a JSON `"false"` string must not
    pass as a bool). User overrides live in `data/settings.json` with

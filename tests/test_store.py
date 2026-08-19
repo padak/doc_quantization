@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -46,6 +48,34 @@ def test_reopening_existing_database_keeps_data(tmp_path: Path) -> None:
         assert second.reconstruct(doc_id) == "".join(CHUNKS)
     finally:
         second.close()
+
+
+def test_default_store_refuses_use_from_another_thread(tmp_path: Path) -> None:
+    """The same-thread guard stays on by default.
+
+    It is what catches a parallel flow accidentally writing from a worker
+    thread, so loosening it must remain an explicit opt-in.
+    """
+    chunk_store = ChunkStore(tmp_path / "chunks.db")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(sqlite3.ProgrammingError):
+                pool.submit(chunk_store.list_documents).result()
+    finally:
+        chunk_store.close()
+
+
+def test_cross_thread_store_can_be_handed_between_threads(tmp_path: Path) -> None:
+    chunk_store = ChunkStore(tmp_path / "chunks.db", allow_cross_thread=True)
+    try:
+        doc_id = chunk_store.add_document("doc.md", CHUNKS)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            listed = pool.submit(chunk_store.list_documents).result()
+            reconstructed = pool.submit(chunk_store.reconstruct, doc_id).result()
+        assert [doc["doc_id"] for doc in listed] == [doc_id]
+        assert reconstructed == "".join(CHUNKS)
+    finally:
+        chunk_store.close()
 
 
 def test_add_document_and_reconstruct(store: ChunkStore) -> None:

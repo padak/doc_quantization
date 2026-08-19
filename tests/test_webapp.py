@@ -16,6 +16,7 @@ import sqlite3
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -452,6 +453,43 @@ def detect(harness: Harness, doc_id: str) -> dict:
     assert events, "the stream carried no events"
     assert events[-1]["type"] == "done", events[-1]
     return events[-1]
+
+
+# ---------------------------------------------------------------------------
+# frontend serving and per-request store threading
+# ---------------------------------------------------------------------------
+
+
+def test_frontend_files_demand_revalidation(harness):
+    """Without this header browsers cache app.js heuristically for days and
+    keep rendering a long-gone UI after a deploy."""
+    for path in ("/", "/static/app.js"):
+        response = harness.client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["cache-control"] == server.STATIC_CACHE_CONTROL
+
+
+def test_api_responses_are_not_marked_for_frontend_revalidation(harness):
+    response = harness.client.get("/api/documents")
+    assert response.status_code == 200
+    assert "cache-control" not in response.headers
+
+
+def test_request_store_survives_the_threadpool_handoff(tmp_path):
+    """FastAPI may run a sync dependency and the endpoint it feeds on two
+    different worker threads; the per-request store must tolerate the hop.
+
+    Regression: with sqlite3's same-thread guard on, a request whose
+    dependency and endpoint landed on different workers intermittently died
+    with ProgrammingError.
+    """
+    config = SimpleNamespace(database=SimpleNamespace(path=tmp_path / "chunks.db"))
+    store = server.get_store(config)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(store.list_documents).result() == []
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------------------
