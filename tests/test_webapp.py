@@ -575,7 +575,7 @@ def test_conversion_service_url_setting_routes_the_upload(harness):
     ]
 
 
-def test_empty_conversion_service_url_setting_converts_locally(harness, monkeypatch):
+def test_empty_conversion_service_url_setting_runs_text_only(harness, monkeypatch):
     """A cleared field wins over a service_url left in the config."""
     set_conversion_service(monkeypatch, "http://from-config:9000")
     harness.client.put("/api/settings", json={"conversion_service_url": ""})
@@ -585,8 +585,8 @@ def test_empty_conversion_service_url_setting_converts_locally(harness, monkeypa
         files={"file": ("report.html", SAMPLE_HTML.encode("utf-8"), "text/html")},
     )
 
-    assert response.status_code == 200, response.text
-    assert "# Acme Report" in response.json()["markdown"]
+    assert response.status_code == 422, response.text
+    assert "no conversion service" in response.json()["detail"]
     assert harness.http.posted == []
 
 
@@ -662,19 +662,6 @@ def test_upload_shows_multibyte_characters_whole(harness):
     assert "Petr Šimeček <petr@keboola.com>" in rendered
 
 
-def test_upload_html_is_converted_to_markdown(harness):
-    response = harness.client.post(
-        "/api/documents",
-        files={"file": ("report.html", SAMPLE_HTML.encode("utf-8"), "text/html")},
-    )
-
-    assert response.status_code == 200, response.text
-    document = response.json()
-    assert "# Acme Report" in document["markdown"]
-    assert "<p>" not in document["markdown"]
-    assert "".join(chunk["text"] for chunk in document["chunks"]) == document["markdown"]
-
-
 def test_upload_uses_the_conversion_service_when_one_is_configured(harness, monkeypatch):
     set_conversion_service(monkeypatch, "http://converter:9000")
     harness.http.serve_conversion("# Converted\n\nJan Novak signed it.\n")
@@ -706,14 +693,18 @@ def test_markdown_upload_never_reaches_the_conversion_service(harness, monkeypat
     assert harness.http.posted == []
 
 
-def test_upload_falls_back_to_markitdown_without_a_service(harness):
+def test_upload_without_a_service_is_rejected_with_guidance(harness):
+    """The app ships no converter: non-text uploads need the companion service."""
     response = harness.client.post(
         "/api/documents",
         files={"file": ("report.html", SAMPLE_HTML.encode("utf-8"), "text/html")},
     )
 
-    assert response.status_code == 200, response.text
-    assert "# Acme Report" in response.json()["markdown"]
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert "no conversion service" in detail
+    assert "doc_converter" in detail
+    assert "Settings" in detail
     assert harness.http.posted == []
 
 
@@ -1389,7 +1380,6 @@ def verify(harness: Harness) -> dict[str, dict]:
     assert set(checks) == {
         "anthropic",
         "local_llm",
-        "markitdown",
         "conversion",
         "database",
     }
@@ -1414,7 +1404,7 @@ def test_verify_passes_when_the_whole_environment_is_there(harness):
     assert checks["local_llm"]["ok"] is True
     assert harness.http.requested == [f"{config.synthetic.llm.base_url}/models"]
     assert harness.http.closed is True
-    assert checks["markitdown"]["ok"] is True
+    assert checks["conversion"]["ok"] is True
     assert checks["database"]["ok"] is True
     assert str(harness.db_path) in checks["database"]["detail"]
 
@@ -1457,7 +1447,7 @@ def test_verify_reports_an_unreachable_local_llm_with_a_hint(harness):
     assert checks["all_ok"] is False
     # The endpoint failing says nothing about the rest of the environment.
     assert checks["anthropic"]["ok"] is True
-    assert checks["markitdown"]["ok"] is True
+    assert checks["conversion"]["ok"] is True
 
 
 def test_verify_lists_what_the_local_llm_serves_instead(harness):
@@ -1505,22 +1495,26 @@ def test_verify_passes_the_conversion_check_without_a_service(harness):
     checks = verify(harness)
 
     assert checks["conversion"]["ok"] is True
-    assert "markitdown" in checks["conversion"]["detail"]
-    # A feature deliberately not in use is never probed.
-    assert all("/health" not in url for url in harness.http.requested)
+    assert checks["conversion"]["detail"].startswith("no conversion service configured")
+    # Text-only mode is a deliberate state, not a broken environment.
+    assert harness.http.posted == []
 
 
 def test_verify_probes_a_configured_conversion_service(harness, monkeypatch):
     set_conversion_service(monkeypatch, "http://converter:9000/")
-    harness.http.response = SimpleNamespace(
-        status_code=200, json=lambda: {"status": "ok", "engine": "pymupdf"}
-    )
+    harness.http.serve_conversion("# Preflight sample")
 
     checks = verify(harness)
 
     assert checks["conversion"]["ok"] is True
-    assert "engine=pymupdf" in checks["conversion"]["detail"]
-    assert "http://converter:9000/health" in harness.http.requested
+    assert checks["conversion"]["detail"].startswith(
+        "conversion service at http://converter:9000/"
+    )
+    assert "characters of markdown" in checks["conversion"]["detail"]
+    # The check took the same route an upload takes: POST /convert.
+    assert [entry["url"] for entry in harness.http.posted] == [
+        "http://converter:9000/convert"
+    ]
 
 
 def test_verify_probes_the_conversion_service_from_the_settings(harness):
@@ -1528,15 +1522,15 @@ def test_verify_probes_the_conversion_service_from_the_settings(harness):
     harness.client.put(
         "/api/settings", json={"conversion_service_url": "http://converter:9000"}
     )
-    harness.http.response = SimpleNamespace(
-        status_code=200, json=lambda: {"status": "ok", "engine": "pymupdf"}
-    )
+    harness.http.serve_conversion("# Preflight sample")
 
     checks = verify(harness)
 
     assert checks["conversion"]["ok"] is True
-    assert "engine=pymupdf" in checks["conversion"]["detail"]
-    assert "http://converter:9000/health" in harness.http.requested
+    assert "conversion service at http://converter:9000" in checks["conversion"]["detail"]
+    assert [entry["url"] for entry in harness.http.posted] == [
+        "http://converter:9000/convert"
+    ]
 
 
 def test_verify_follows_a_conversion_service_cleared_in_the_settings(harness, monkeypatch):
@@ -1547,26 +1541,25 @@ def test_verify_follows_a_conversion_service_cleared_in_the_settings(harness, mo
     checks = verify(harness)
 
     assert checks["conversion"]["ok"] is True
-    assert "markitdown" in checks["conversion"]["detail"]
-    assert all("/health" not in url for url in harness.http.requested)
+    assert checks["conversion"]["detail"].startswith("no conversion service configured")
+    assert harness.http.posted == []
 
 
 def test_verify_reports_an_unreachable_conversion_service(harness, monkeypatch):
     set_conversion_service(monkeypatch, "http://converter:9000")
-    harness.http.error = httpx.ConnectError("connection refused")
+    harness.http.post_error = httpx.ConnectError("connection refused")
 
     checks = verify(harness)
 
     assert checks["conversion"]["ok"] is False
-    assert "http://converter:9000/health" in checks["conversion"]["detail"]
-    assert "conversion.service_url" in checks["conversion"]["detail"]
+    assert "http://converter:9000/convert" in checks["conversion"]["detail"]
+    assert "Conversion service URL" in checks["conversion"]["detail"]
     assert checks["all_ok"] is False
 
 
 def test_verify_reports_a_conversion_service_error_response(harness, monkeypatch):
     set_conversion_service(monkeypatch, "http://converter:9000")
-    harness.http.error = None
-    harness.http.response = SimpleNamespace(status_code=503, json=lambda: {})
+    harness.http.serve_conversion("", status_code=503)
 
     checks = verify(harness)
 
@@ -1574,29 +1567,14 @@ def test_verify_reports_a_conversion_service_error_response(harness, monkeypatch
     assert "503" in checks["conversion"]["detail"]
 
 
-def test_verify_reports_a_broken_converter(harness, monkeypatch):
-    def broken() -> None:
-        raise RuntimeError("markitdown is not installed")
-
-    monkeypatch.setattr(server, "get_markitdown", broken)
+def test_verify_reports_a_service_that_returns_no_markdown(harness, monkeypatch):
+    set_conversion_service(monkeypatch, "http://converter:9000")
+    harness.http.serve_conversion("   ")
 
     checks = verify(harness)
 
-    assert checks["markitdown"]["ok"] is False
-    assert "markitdown is not installed" in checks["markitdown"]["detail"]
-    assert checks["all_ok"] is False
-
-
-def test_verify_reports_a_converter_that_returns_nothing(harness, monkeypatch):
-    monkeypatch.setattr(
-        server,
-        "get_markitdown",
-        lambda: SimpleNamespace(convert=lambda source: SimpleNamespace(markdown="  ")),
-    )
-
-    checks = verify(harness)
-
-    assert checks["markitdown"]["ok"] is False
+    assert checks["conversion"]["ok"] is False
+    assert "returned no markdown" in checks["conversion"]["detail"]
     assert checks["all_ok"] is False
 
 

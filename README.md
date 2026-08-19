@@ -124,7 +124,7 @@ Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q          # 238 tests should pass
+.venv/bin/pytest -q          # 368 tests should pass
 ```
 
 On macOS, `python3` may point at the system interpreter shipped with Xcode,
@@ -166,14 +166,15 @@ OpenAI-compatible endpoint — for example [Ollama](https://ollama.com)
 Point `synthetic.llm.base_url` in `config/config.json` at it. Without one,
 commands fail fast with an actionable message.
 
-## Conversion service (recommended)
+## Conversion service (required for PDF, DOCX, HTML)
 
-For high-quality PDF extraction, pair this app with its companion project
-[doc_converter](https://github.com/padak/doc_converter) — a small AGPL-3.0
-HTTP service whose PDF engine (PyMuPDF) fixes the glued-words artifacts of
-the built-in converter. It lives in a separate repository on purpose: the
-AGPL engine stays behind a generic HTTP boundary, so this repository remains
-pure Apache-2.0.
+This app deliberately ships no document converter: Markdown and plain text
+are ingested directly, and every other format is converted by the companion
+project [doc_converter](https://github.com/padak/doc_converter) — a small
+AGPL-3.0 HTTP service whose PDF engine (PyMuPDF) extracts text with correct
+word spacing. It lives in a separate repository on purpose: the AGPL engine
+stays behind a generic HTTP boundary, so this repository remains pure
+Apache-2.0 with a lean dependency tree.
 
 ```bash
 git clone https://github.com/padak/doc_converter
@@ -184,9 +185,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Then set the Conversion service URL to `http://localhost:8802` in the web
 console's Settings (persisted to `data/settings.json`), or as
-`conversion.service_url` in `config/config.json`. With the URL empty, uploads
-use the built-in markitdown converter (weaker PDF word spacing). The Verify
-setup button in Settings reports the service's health, and any service
+`conversion.service_url` in `config/config.json`. This app deliberately ships
+no converter of its own: with the URL empty it runs in text-only mode and
+accepts only Markdown and plain text uploads. The Verify setup button in
+Settings exercises the configured service end to end, and any service
 implementing the same `/convert` + `/health` contract is a drop-in
 replacement.
 
@@ -235,7 +237,7 @@ All tunables live in `config/config.json`:
 | `chunking.chunk_size_tokens` | `22` | Tokens per stored chunk |
 | `chunking.encoding` | `cl100k_base` | tiktoken encoding |
 | `chunking.name_run_max_extension_tokens` | `12` | Max extra tokens a cut may move so it never splits a capitalized name run |
-| `conversion.service_url` | `""` (empty) | Optional external conversion service; empty means the built-in markitdown converter is used |
+| `conversion.service_url` | `""` (empty) | External conversion service for PDF/DOCX/HTML uploads; empty means text-only mode (Markdown and plain text only) |
 | `anthropic.model` | `claude-opus-5` | Detection model |
 | `anthropic.effort` | `low` | Reasoning effort for detection requests |
 | `anthropic.max_tokens` | `1024` | Max output tokens per request |

@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import tempfile
 import time
 import uuid
 from collections import Counter
@@ -47,7 +46,6 @@ import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from markitdown import FileConversionException, MarkItDown, UnsupportedFormatException
 from pydantic import BaseModel
 
 from doc_quant.chunker import Chunker
@@ -101,18 +99,15 @@ _LOG_HANDLER_MARKER = "doc_quant_webapp"
 # Suffixes whose bytes are already Markdown-ish text: running them through a
 # converter would only risk mangling what the user wrote.
 RAW_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
-UPLOAD_STEM = "upload"
 
 # The optional external conversion service (see `conversion` in
 # config/config.json): one endpoint that takes a file and answers with
 # Markdown, and one that says whether it is up.
 CONVERT_PATH = "/convert"
-HEALTH_PATH = "/health"
 CONVERT_FILE_FIELD = "file"
 CONVERT_MARKDOWN_FIELD = "markdown"
 # Converting a large PDF well takes time; this is not the preflight's timeout.
 CONVERT_TIMEOUT_SECONDS = 120.0
-CONVERSION_BUILTIN_DETAIL = "built-in markitdown (no conversion service configured)"
 FALLBACK_UPLOAD_NAME = "upload"
 
 # A synchronous run is still recorded as a batch so that honeytoken results and
@@ -153,15 +148,13 @@ PHASE_SYNTHETICS_TEMPLATE_DETAIL = "deterministic templates (local LLM disabled)
 # Preflight checks reported by /api/verify.
 CHECK_ANTHROPIC = "anthropic"
 CHECK_LOCAL_LLM = "local_llm"
-CHECK_MARKITDOWN = "markitdown"
 CHECK_DATABASE = "database"
 CHECK_CONVERSION = "conversion"
 CHECK_LABELS = {
     CHECK_ANTHROPIC: "Anthropic API",
     CHECK_LOCAL_LLM: "Local LLM",
-    CHECK_MARKITDOWN: "Document conversion",
     CHECK_DATABASE: "Database",
-    CHECK_CONVERSION: "Conversion service",
+    CHECK_CONVERSION: "Document conversion",
 }
 VERIFY_NO_KEY_DETAIL = (
     "No Anthropic API key stored: add one in Settings (or set the "
@@ -250,11 +243,6 @@ def get_anthropic_client(api_key: str | None) -> Any:
 def get_generator(config: AppConfig, store: ChunkStore) -> Any:
     """Build the synthetic fragment generator."""
     return SyntheticGenerator(config, store)
-
-
-def get_markitdown() -> Any:
-    """Build the document converter."""
-    return MarkItDown()
 
 
 def get_http_client(timeout: float = VERIFY_HTTP_TIMEOUT_SECONDS) -> Any:
@@ -527,10 +515,10 @@ def _to_markdown(
 
     Text formats are taken verbatim and always locally: they are already what
     the pipeline wants, and a round trip through any converter could only alter
-    them. Everything else goes to the external conversion service when one is
-    configured, and otherwise through markitdown, which needs a real file, so
-    the bytes are written to a temporary one carrying the original suffix -
-    that suffix is how the converter picks its reader.
+    them. Everything else requires the external conversion service - this app
+    deliberately ships no converter of its own; conversion is the companion
+    service's whole job (and keeping it behind an HTTP boundary is what keeps
+    this repository free of the AGPL PDF stack).
     """
     suffix = Path(filename).suffix
     if suffix.lower() in RAW_TEXT_SUFFIXES:
@@ -545,33 +533,15 @@ def _to_markdown(
     if conversion is not None and conversion.service_url:
         return _convert_via_service(filename, raw, conversion.service_url)
 
-    with tempfile.TemporaryDirectory() as directory:
-        source = Path(directory) / f"{UPLOAD_STEM}{suffix}"
-        source.write_bytes(raw)
-        try:
-            result = get_markitdown().convert(source)
-        except (
-            FileConversionException,
-            UnsupportedFormatException,
-            ValueError,
-            OSError,
-        ) as exc:
-            raise HTTPException(
-                status_code=HTTP_UNPROCESSABLE,
-                detail=f"Cannot convert {filename} to Markdown: {exc}",
-            ) from exc
-
-    # markitdown named the field `text_content` before it grew `markdown`;
-    # accept either so the app works across both.
-    text = getattr(result, "markdown", None)
-    if not isinstance(text, str):
-        text = getattr(result, "text_content", None)
-    if not isinstance(text, str):
-        raise HTTPException(
-            status_code=HTTP_UNPROCESSABLE,
-            detail=f"Conversion of {filename} returned no text",
-        )
-    return text
+    raise HTTPException(
+        status_code=HTTP_UNPROCESSABLE,
+        detail=(
+            f"Cannot convert {filename}: no conversion service is configured. "
+            "Set the Conversion service URL in Settings to a running "
+            "doc_converter instance (github.com/padak/doc_converter), or "
+            "upload Markdown/plain text directly."
+        ),
+    )
 
 
 def _convert_via_service(filename: str, raw: bytes, service_url: str) -> str:
@@ -1170,8 +1140,7 @@ def verify(context: RequestContext = Depends(context_dependency)) -> dict:
     checks = [
         _check_anthropic(context),
         _check_local_llm(context.config),
-        _check_markitdown(),
-        _check_conversion_service(context.config),
+        _check_conversion(context.config),
         _check_database(context.config),
     ]
     all_ok = all(check["ok"] for check in checks)
@@ -1281,78 +1250,58 @@ def _serves_model(model: str, model_ids: list[str]) -> bool:
     return model in model_ids or f"{model}{OLLAMA_DEFAULT_TAG}" in model_ids
 
 
-def _check_markitdown() -> dict:
-    """Convert a tiny HTML document to prove the converter is usable."""
-    started = time.perf_counter()
-    try:
-        markdown = _to_markdown(VERIFY_SAMPLE_NAME, VERIFY_SAMPLE_HTML)
-    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
-        logger.warning("Preflight: markitdown check failed: %s", exc)
-        return _check(CHECK_MARKITDOWN, False, _readable(exc), started)
+def _check_conversion(config: AppConfig) -> dict:
+    """Convert a tiny sample through the conversion path uploads actually take.
 
-    if not markdown.strip():
-        return _check(
-            CHECK_MARKITDOWN, False, "conversion returned no markdown", started
-        )
-    return _check(
-        CHECK_MARKITDOWN,
-        True,
-        f"converted a sample document to {len(markdown)} characters of markdown",
-        started,
-    )
-
-
-def _check_conversion_service(config: AppConfig) -> dict:
-    """Confirm the external conversion service answers, when one is configured.
-
-    With no service configured the check passes: the built-in converter is a
-    complete answer, and a feature deliberately not in use must not report the
-    environment as broken.
+    With a conversion service configured the sample goes through its /convert
+    endpoint - the same route every upload takes - so a green check proves the
+    path that is really in use. Without one the app is in text-only mode
+    (Markdown and plain text passthrough); that is a deliberate state, not a
+    broken environment, so the check passes and says what it means.
     """
     started = time.perf_counter()
     service_url = config.conversion.service_url
     if not service_url:
-        return _check(CHECK_CONVERSION, True, CONVERSION_BUILTIN_DETAIL, started)
-
-    url = f"{service_url.rstrip('/')}{HEALTH_PATH}"
-    hint = (
-        "start the conversion service, or clear conversion.service_url "
-        "(Settings > Conversion service URL) to use the built-in markitdown "
-        "converter"
-    )
-    try:
-        client = get_http_client()
-        try:
-            response = client.get(url)
-        finally:
-            client.close()
-    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
-        logger.warning("Preflight: conversion service unreachable at %s: %s", url, exc)
         return _check(
-            CHECK_CONVERSION, False, f"{url} unreachable ({exc}); {hint}", started
+            CHECK_CONVERSION,
+            True,
+            (
+                "no conversion service configured - only Markdown and plain "
+                "text uploads are accepted; set the Conversion service URL in "
+                "Settings to convert PDF, DOCX or HTML"
+            ),
+            started,
         )
 
-    status_code = getattr(response, "status_code", None)
-    if status_code != 200:
+    hint = (
+        "; start the conversion service, or clear the Conversion service URL "
+        "in Settings to run in text-only mode"
+    )
+    try:
+        markdown = _to_markdown(
+            VERIFY_SAMPLE_NAME, VERIFY_SAMPLE_HTML, config.conversion
+        )
+    except HTTPException as exc:
+        logger.warning("Preflight: conversion check failed: %s", exc.detail)
+        return _check(CHECK_CONVERSION, False, f"{exc.detail}{hint}", started)
+    except Exception as exc:  # noqa: BLE001 - a failed check is the answer
+        logger.warning("Preflight: conversion check failed: %s", exc)
+        return _check(CHECK_CONVERSION, False, f"{_readable(exc)}{hint}", started)
+
+    if not markdown.strip():
         return _check(
             CHECK_CONVERSION,
             False,
-            f"{url} answered HTTP {status_code}; {hint}",
+            f"conversion service at {service_url} returned no markdown{hint}",
             started,
         )
-    return _check(CHECK_CONVERSION, True, f"{url}: {_health_detail(response)}", started)
-
-
-def _health_detail(response: Any) -> str:
-    """Render whatever the health endpoint said about itself."""
-    try:
-        body = response.json()
-    except (ValueError, TypeError):
-        text = getattr(response, "text", "")
-        return str(text).strip() or "ok"
-    if isinstance(body, dict):
-        return ", ".join(f"{key}={value}" for key, value in body.items()) or "ok"
-    return str(body)
+    return _check(
+        CHECK_CONVERSION,
+        True,
+        f"conversion service at {service_url}: converted a sample document "
+        f"to {len(markdown)} characters of markdown",
+        started,
+    )
 
 
 def _check_database(config: AppConfig) -> dict:

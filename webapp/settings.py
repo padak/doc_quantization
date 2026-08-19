@@ -38,7 +38,7 @@ BOOL_SETTINGS_KEYS: tuple[str, ...] = ("llm_enabled",)
 
 # String keys whose empty value is a decision rather than an absence, so they
 # are stored by presence: an empty conversion service URL says "convert with the
-# built-in markitdown", which is a different statement from "no override, take
+# text-only mode", which is a different statement from "no override, take
 # whatever config/config.json says". Every other string key falls back to the
 # config once it is cleared, which is why an empty one is dropped there.
 PRESENCE_SETTINGS_KEYS: tuple[str, ...] = ("conversion_service_url",)
@@ -213,7 +213,7 @@ def effective_conversion_service_url(
 ) -> str:
     """Where documents are converted: an external service, or nothing.
 
-    An empty result means the built-in markitdown converter. The stored setting
+    An empty result means text-only mode (no converter). The stored setting
     wins whenever it is present, empty included - a user who cleared the field
     asked for the built-in converter, which the config's own URL must not undo.
     """
