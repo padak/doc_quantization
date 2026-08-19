@@ -4,7 +4,9 @@ All tunables live in the JSON file; nothing is hardcoded in the modules.
 Required keys fail fast at load time with a clear error message.
 The Anthropic API key is read from the ANTHROPIC_API_KEY environment
 variable only at the moment an API call is about to be made (see
-`require_api_key`), so offline commands work without it.
+`require_api_key`), so offline commands work without it. The CLI loads a
+`.env` file from the project root at startup (see `load_env_file`); real
+environment variables always win over the file.
 """
 
 from __future__ import annotations
@@ -14,8 +16,21 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def load_env_file(path: Path | None = None) -> None:
+    """Load variables from a .env file into the process environment.
+
+    Variables already set in the real environment take precedence, so an
+    exported ANTHROPIC_API_KEY always wins over the file. A missing file is
+    silently ignored — the .env file is optional.
+    """
+    load_dotenv(dotenv_path=path or DEFAULT_ENV_PATH, override=False)
 
 
 class ConfigError(Exception):

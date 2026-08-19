@@ -25,7 +25,13 @@ from typing import Any
 import anthropic
 
 from doc_quant.chunker import Chunker
-from doc_quant.config import AppConfig, ConfigError, load_config, require_api_key
+from doc_quant.config import (
+    AppConfig,
+    ConfigError,
+    load_config,
+    load_env_file,
+    require_api_key,
+)
 from doc_quant.detector import KIND_CANARY, Detector
 from doc_quant.redactor import redact_text
 from doc_quant.store import ChunkStore
@@ -552,6 +558,7 @@ def _dispatch(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file()
     parser = _build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(

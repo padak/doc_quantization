@@ -75,7 +75,7 @@ Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q          # 234 tests should pass
+.venv/bin/pytest -q          # 238 tests should pass
 ```
 
 On macOS, `python3` may point at the system interpreter shipped with Xcode,
@@ -88,8 +88,28 @@ inside the virtual environment and retry:
 .venv/bin/pip install -r requirements.txt
 ```
 
-Set `ANTHROPIC_API_KEY` in your environment for the `submit`, `status`,
-`fetch` and `canary-probe` commands. Offline commands work without it.
+### API key
+
+The `submit`, `status`, `fetch` and `canary-probe` commands talk to the
+Anthropic API and need `ANTHROPIC_API_KEY`. Offline commands work without it.
+
+Put the key in a `.env` file in the project root — unlike `export`, it does
+not end up in your shell history:
+
+```bash
+cp env.sample .env
+```
+
+Then edit `.env` and replace the placeholder with your real key (create one
+at <https://console.anthropic.com/settings/keys>):
+
+```
+ANTHROPIC_API_KEY=your-api-key
+```
+
+The CLI loads `.env` automatically on startup. `.env` is gitignored; never
+commit it. A variable already exported in your shell takes precedence over
+the file, so CI and one-off overrides keep working.
 
 Generating synthetic fragments requires a running local LLM server with an
 OpenAI-compatible endpoint — for example [Ollama](https://ollama.com)
