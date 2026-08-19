@@ -228,3 +228,75 @@ def test_effective_config_applies_overrides_including_zero_and_false():
     assert effective.synthetic.honeytokens_enabled is False
     assert effective.synthetic.chaff_enabled is False
     assert effective.synthetic.canaries_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# detection provider: an enum key validated on both write and read
+# ---------------------------------------------------------------------------
+
+
+def test_detection_provider_override_is_validated(settings_path):
+    with pytest.raises(ConfigError, match="detection_provider"):
+        save_overrides(settings_path, {"detection_provider": "remote"})
+
+
+def test_detection_provider_override_applies(settings_path):
+    save_overrides(settings_path, {"detection_provider": "local"})
+
+    overrides = load_overrides(settings_path)
+    config = effective_config(load_config(), overrides)
+
+    assert config.detection.provider == "local"
+
+
+def test_detection_local_endpoint_overrides_apply(settings_path):
+    save_overrides(
+        settings_path,
+        {
+            "detection_local_base_url": "http://elsewhere:9999/v1",
+            "detection_local_model": "llama3.2:1b",
+        },
+    )
+
+    config = effective_config(load_config(), load_overrides(settings_path))
+
+    assert config.detection.local.base_url == "http://elsewhere:9999/v1"
+    assert config.detection.local.model == "llama3.2:1b"
+
+
+def test_invalid_stored_provider_fails_on_read(settings_path):
+    # A file written by hand (or by an older build) must be rejected the moment
+    # it is read, not silently used to pick a backend nobody asked for.
+    settings_path.write_text('{"detection_provider": "remote"}', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="detection_provider"):
+        load_overrides(settings_path)
+
+
+def test_detection_overrides_are_clearable(settings_path):
+    save_overrides(
+        settings_path,
+        {"detection_provider": "local", "detection_local_model": "llama3.2:1b"},
+    )
+
+    merged = save_overrides(
+        settings_path, {"detection_provider": "", "detection_local_model": None}
+    )
+
+    assert "detection_provider" not in merged
+    assert "detection_local_model" not in merged
+    config = effective_config(load_config(), load_overrides(settings_path))
+    assert config.detection.provider == load_config().detection.provider
+
+
+def test_detection_provider_rejects_a_non_string(settings_path):
+    with pytest.raises(ConfigError, match="detection_provider"):
+        save_overrides(settings_path, {"detection_provider": True})
+
+
+def test_effective_config_keeps_detection_defaults_with_no_overrides():
+    config = load_config()
+
+    effective = effective_config(config, {})
+
+    assert effective.detection == config.detection

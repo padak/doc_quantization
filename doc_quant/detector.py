@@ -339,25 +339,18 @@ class Detector:
         counts["honeytokens_scored"] += 1
 
 
-def parse_entities(message: Any) -> list[tuple[str, str]]:
-    """Extract (text, type) pairs from a successful detection message.
+def parse_entities_payload(payload: Any) -> list[tuple[str, str]]:
+    """Extract (text, type) pairs from a decoded detection answer.
 
-    Public because the batch path here and any synchronous transport must read
-    a detection answer by the exact same rules; a stricter or laxer second
-    parser would make the two paths disagree about what the provider returned.
+    Shared by every transport: the Anthropic paths hand over the parsed JSON
+    of a message's text block, a local path the parsed JSON of a chat
+    completion. One set of rules, so no two paths can disagree about what a
+    provider returned — and a model that is merely lax about the schema is
+    rejected here rather than silently widening what counts as an entity.
 
     Raises ValueError, KeyError or TypeError when the payload does not match
     the requested schema; callers count that as an errored chunk.
     """
-    text_block = None
-    for block in message.content:
-        if getattr(block, "type", None) == "text":
-            text_block = block
-            break
-    if text_block is None:
-        raise ValueError("no text content block in message")
-
-    payload = json.loads(text_block.text)
     if not isinstance(payload, dict):
         raise TypeError(f"expected a JSON object, got {type(payload).__name__}")
 
@@ -377,6 +370,29 @@ def parse_entities(message: Any) -> list[tuple[str, str]]:
             raise ValueError(f"unknown entity type {entity_type!r}")
         entities.append((entity_text, entity_type))
     return entities
+
+
+def parse_entities(message: Any) -> list[tuple[str, str]]:
+    """Extract (text, type) pairs from a successful detection message.
+
+    Public because the batch path here and any synchronous transport must read
+    a detection answer by the exact same rules; a stricter or laxer second
+    parser would make the two paths disagree about what the provider returned.
+    Only the message envelope is unwrapped here — the rules themselves live in
+    `parse_entities_payload`, which transports without a Message object share.
+
+    Raises ValueError, KeyError or TypeError when the payload does not match
+    the requested schema; callers count that as an errored chunk.
+    """
+    text_block = None
+    for block in message.content:
+        if getattr(block, "type", None) == "text":
+            text_block = block
+            break
+    if text_block is None:
+        raise ValueError("no text content block in message")
+
+    return parse_entities_payload(json.loads(text_block.text))
 
 
 # Kept so that any existing caller of the former private name keeps working.

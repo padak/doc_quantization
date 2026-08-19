@@ -5,7 +5,8 @@ split into small fixed-size token chunks that are processed out of context —
 by an LLM or by a human — so that no single party ever sees the full document,
 while the original can always be reassembled byte-exactly. Outbound traffic is
 additionally salted with synthetic fragments (honeytokens, chaff, canaries)
-that only the local registry can subtract.
+that only the local registry can subtract. Detection can also run entirely
+against a local model server, in which case nothing leaves the machine at all.
 
 ## How it works
 
@@ -31,7 +32,9 @@ flowchart LR
    Message Batches API, mixed with synthetic fragments that are
    indistinguishable from real ones by request shape. Structured outputs
    enforce an exact-substring entity schema:
-   `{"entities": [{"text": ..., "type": "person" | "company"}]}`.
+   `{"entities": [{"text": ..., "type": "person" | "company"}]}`. Setting
+   `detection.provider` to `local` asks the same question of a local model
+   server instead — see [Local detection mode](#local-detection-mode).
 3. **Redact** — documents are reassembled byte-exactly from their chunks and
    every detected name is replaced: persons with `**PERSON**`, companies with
    `**COMPANY**`.
@@ -118,6 +121,61 @@ local LLM only wraps given names in natural prose; its output is validated
 verbatim (3 retries, then a deterministic template fallback), so a
 hallucination can never poison the registry or the tripwire.
 
+## Local detection mode
+
+Detection has two backends, selected by `detection.provider` in
+`config/config.json` or in the web console's Settings:
+
+| Provider | What happens |
+| --- | --- |
+| `anthropic` (default) | Chunks are shuffled, mixed with synthetic fragments and sent to the Anthropic Message Batches API |
+| `local` | Chunks are sent one per request to a local OpenAI-compatible model server; nothing leaves the machine |
+
+Both backends ask the same question — the same system prompt and the same
+exact-substring entity schema, enforced locally through
+`response_format: {"type": "json_schema", ...}`, the shape documented by
+[Ollama](https://ollama.com) and LM Studio. Only the transport differs. The
+CLI's `detect` command and the web console share one module for it, so the
+two can never drift apart.
+
+```bash
+ollama serve
+ollama pull qwen2.5:7b
+python -m doc_quant.cli detect
+# Detected batch local-4f19c2ab7d10: chunks=41 ok=41 errored=0 entities=12 dropped=0
+```
+
+In the web console the same run streams into the usual live progress view,
+one line per call; the Settings page carries a Detection section where the
+provider, the endpoint and the model are set. The model field offers what the
+configured server actually serves — model ids have to match the server's own
+spelling, tag included, and that is precisely what nobody can guess.
+
+**What local mode deliberately drops.** Honeytokens, chaff, canaries and the
+shuffle all exist to make a *remote* provider's retained copy of the traffic
+worthless. With nothing leaving the machine there is no corpus to dilute, no
+recall to measure and nobody to hide the document's shape from, so all of it
+is switched off for a local run and the recall figure is reported as absent
+rather than as a misleading zero. Chunks stay the detection unit even though
+the whole document could be handed over in one go: small local models recall
+names noticeably better on short fragments.
+
+**What local mode adds.** A verbatim guard. Anthropic's structured outputs
+enforce the exact-substring contract hard; a small local model can return a
+name that appears nowhere in the fragment, so every entity that is not a
+substring of its own fragment is dropped before it can reach the entities
+table, and the count is reported (`dropped=` above, and in the run log).
+
+**Each backend refuses the other's commands** rather than doing something
+surprising with your data. Under `local`, `submit`, `fetch` and
+`status <batch_id>` stop with a message pointing at `detect`; under
+`anthropic`, `detect` does the same in reverse. Bare `status`, which only
+lists stored batches, keeps working offline under both. Before anything is
+recorded, both the CLI and the web console probe the local server, so an
+unreachable one leaves the document exactly as it was — the console reports
+it as a 503 naming the endpoint, the same way a missing API key is handled on
+the remote path.
+
 ## Installation
 
 Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
@@ -125,7 +183,7 @@ Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q          # 426 tests should pass
+.venv/bin/pytest -q          # 503 tests should pass
 ```
 
 On macOS, `python3` may point at the system interpreter shipped with Xcode,
@@ -141,7 +199,8 @@ inside the virtual environment and retry:
 ### API key
 
 The `submit`, `status`, `fetch` and `canary-probe` commands talk to the
-Anthropic API and need `ANTHROPIC_API_KEY`. Offline commands work without it.
+Anthropic API and need `ANTHROPIC_API_KEY`. Offline commands work without it,
+including `detect`: local detection needs no key at all.
 
 Put the key in a `.env` file in the project root — unlike `export`, it does
 not end up in your shell history:
@@ -209,6 +268,9 @@ python -m doc_quant.cli submit
 python -m doc_quant.cli status <batch_id>
 python -m doc_quant.cli fetch <batch_id>
 
+# 3+4 with detection.provider=local: one synchronous pass, nothing sent out
+python -m doc_quant.cli detect
+
 # 5. Write redacted documents
 python -m doc_quant.cli redact ./redacted
 
@@ -243,6 +305,11 @@ All tunables live in `config/config.json`:
 | `anthropic.effort` | `low` | Reasoning effort for detection requests |
 | `anthropic.max_tokens` | `1024` | Max output tokens per request |
 | `anthropic.detect_concurrency` | `6` | Detection requests kept in flight by the web app's synchronous path |
+| `detection.provider` | `anthropic` | Detection backend: `anthropic` (Batch API) or `local` (local model server) |
+| `detection.local.base_url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint used for local detection |
+| `detection.local.model` | `qwen2.5:7b` | Model asked for names in local mode |
+| `detection.local.timeout_seconds` | `120` | Timeout for a single local detection request |
+| `detection.local.concurrency` | `2` | Local detection requests kept in flight |
 | `redaction.person` | `**PERSON**` | Placeholder for person names |
 | `redaction.company` | `**COMPANY**` | Placeholder for company names |
 | `redaction.email` | `**EMAIL**` | Placeholder for email addresses, replaced whole and without the detector |
@@ -288,9 +355,12 @@ Even then, it holds:
 
 ### What it does not hide
 
-- **Unknown names must travel** — finding them is the job. What never has to
-  travel are names you already know (roadmap: a local-first detection pass so
-  known entities are pre-redacted before anything leaves the machine).
+- **Unknown names must travel** — finding them is the job, as long as a remote
+  model is the one doing it. What never has to travel are names you already
+  know; and with `detection.provider` set to `local` nothing travels at all,
+  traded against the recall of a model that fits on your machine (roadmap: the
+  hybrid in between — pre-redact locally known entities, send only the
+  residual candidates to the API).
 - **Co-membership.** All fragments arrive from one account, so "these belong
   to the same client" is observable; what they form is not.
 - **Reassembly is a statistical fight, not a lookup.** Outbound fragments are

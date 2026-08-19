@@ -13,6 +13,11 @@
   const VIEWS = ['document', 'chunks', 'batch', 'llm', 'redaction', 'report', 'settings'];
   const KINDS = ['real', 'honeytoken', 'chaff', 'canary'];
   const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+  // Which backend answers the detection question. Mirrors the server's
+  // VALID_DETECTION_PROVIDERS; an unknown stored value is still offered so a
+  // hand-edited settings file is visible rather than silently rewritten.
+  const DETECTION_PROVIDERS = ['anthropic', 'local'];
+  const PROVIDER_LOCAL = 'local';
   const INTRO_KEY = 'dq.intro.dismissed';
   const LOG_LIMIT = 4000;
   // How much of an id a table shows before eliding it; the full value stays in
@@ -109,6 +114,14 @@
       title: 'chunk_size_tokens',
       body: 'The target size of a chunk in tokens. Smaller chunks leak less context per request; larger chunks give the detector more context to recognise a name.',
     },
+    detection_provider: {
+      title: 'Detection provider',
+      body: 'Which model answers the "which names are in this fragment?" question. Anthropic sends fragments to the provider, mixed with synthetic decoys. Local sends them to a model on this machine instead — nothing leaves the machine, so there is nothing to dilute and no decoys are generated.',
+    },
+    dropped: {
+      title: 'Dropped names',
+      body: 'Names the local model returned that do not appear verbatim in the fragment it was given. They are invented, so they are thrown away rather than stored — the count is the honest measure of how much a small model is making up.',
+    },
     local_llm: {
       title: 'Local LLM',
       body: 'A model running on this machine (typically Ollama) that writes the synthetic prose for honeytokens and chaff. It never sees your document — it only invents decoy text — so nothing real leaves the machine to produce it.',
@@ -139,6 +152,10 @@
     probePlanned: null,      // how many probe calls the running probe is making
     llmModels: null,         // GET /api/llm-models payload
     llmChoice: null,         // picked prose generator, null until the user picks
+    // Model ids a local server says it serves, keyed by the base URL it was
+    // asked at: the detection field and the synthetic-generator field may point
+    // at different servers, so a single global list would offer the wrong ids.
+    localModels: {},         // baseUrl -> [id, ...] (or [] when it did not answer)
     verify: null,            // POST /api/verify payload
     verifyError: null,       // why the check itself could not run
     verifyAuto: false,
@@ -1019,7 +1036,11 @@
 
   function compositionHtml(composition) {
     const comp = composition && typeof composition === 'object' ? composition : {};
-    const values = KINDS.map((kind) => ({ kind: kind, count: num(comp[kind], 0) }));
+    // A kind absent from the payload is a kind that does not apply to this run
+    // (a local run reports only `real`), which is different from a kind that
+    // applies and came out zero — that one keeps its legend row.
+    const values = KINDS.filter((kind) => comp[kind] !== undefined)
+      .map((kind) => ({ kind: kind, count: num(comp[kind], 0) }));
     const total = values.reduce((sum, item) => sum + item.count, 0);
 
     const why = {
@@ -1063,6 +1084,22 @@
     return html;
   }
 
+  /** Is the configured detection backend the local one? */
+  function localDetection() {
+    return Boolean(store.settings) && store.settings.detection_provider === PROVIDER_LOCAL;
+  }
+
+  /** Was this run answered on this machine?
+   *
+   * Told from the run's own payload template — the local one names the
+   * endpoint it called, the remote one never does — so a finished run keeps
+   * its identity even after the provider is switched in Settings.
+   */
+  function runIsLocal(detect) {
+    const template = detect && detect.payload_template;
+    return Boolean(template && typeof template === 'object' && template.base_url);
+  }
+
   function runPlanHtml() {
     const settings = store.settings || {};
     const chunkCount = store.doc ? safeArray(store.doc.chunks).length : 0;
@@ -1070,6 +1107,20 @@
 
     let html = '<div class="run-plan chips">';
     html += '<span class="chip"><span class="chip-k">real chunks</span><span class="chip-v">' + fmtInt(chunkCount) + '</span></span>';
+
+    // A local run has no provider, no synthetic mixing and no effort dial, so
+    // reporting those would describe a run that is not about to happen.
+    if (localDetection()) {
+      html += '<span class="chip"><span class="chip-k">detection</span><span class="chip-v">local' +
+        '</span>' + info('detection_provider') + '</span>';
+      html += '<span class="chip"><span class="chip-k">local model</span><span class="chip-v">' +
+        esc((settings.detection_local_model || 'unset') + ' @ ' +
+          (settings.detection_local_base_url || 'unset')) + '</span></span>';
+      html += '<span class="chip"><span class="chip-k">synthetic mixing</span><span class="chip-v">off</span></span>';
+      html += '</div>';
+      return html;
+    }
+
     html += '<span class="chip"><span class="chip-k">provider model</span><span class="chip-v">' + esc(settings.model || 'unset') + '</span></span>';
     html += '<span class="chip"><span class="chip-k">effort</span><span class="chip-v">' + esc(settings.effort || '—') + '</span></span>';
     html += '<span class="chip"><span class="chip-k">synthetic prose</span><span class="chip-v">' +
@@ -1249,12 +1300,20 @@
     const hasDoc = Boolean(store.doc);
     const settings = store.settings || {};
 
+    // The run on screen decides the wording; before there is one, the
+    // configured provider does.
+    const localMode = store.detect ? runIsLocal(store.detect) : localDetection();
+
     let html = '';
     html += '<div class="page-head">';
     html += '<h2 class="page-title">Batch</h2>';
-    html += '<p class="page-lead">Step 3 of 5 — real chunks are shuffled together with synthetic fragments (' +
-      term('honeytokens', 'honeytoken') + ', ' + term('chaff', 'chaff') + ', ' + term('canaries', 'canary') +
-      ') and each fragment is sent on its own, so nothing recognisable leaves this machine in one piece.</p>';
+    html += '<p class="page-lead">Step 3 of 5 — ' + (localMode
+      ? 'every chunk is answered by a model on this machine, one call per chunk. Nothing leaves the machine, ' +
+        'so no synthetic fragments are mixed in and no ordering has to be hidden.'
+      : 'real chunks are shuffled together with synthetic fragments (' +
+        term('honeytokens', 'honeytoken') + ', ' + term('chaff', 'chaff') + ', ' + term('canaries', 'canary') +
+        ') and each fragment is sent on its own, so nothing recognisable leaves this machine in one piece.') +
+      '</p>';
     html += '</div>';
 
     html += hintHtml('batch');
@@ -1280,13 +1339,18 @@
     } else if (!store.detect && hasStoredRun()) {
       html += storedRunHtml();
     } else {
+      const local = localDetection();
       html += '<div class="card">';
       html += '<h3 class="card-title">Run detection</h3>';
-      html += '<p class="muted" style="margin:0 0 4px">Builds the batch from ' +
-        fmtInt(safeArray(store.doc.chunks).length) + ' real chunks plus synthetic decoys, then makes one provider call per fragment. ' +
-        'Progress is streamed live below — you will see every fragment as it is generated and every answer as it returns.</p>';
+      html += '<p class="muted" style="margin:0 0 4px">' + (local
+        ? 'Asks the local model about each of ' + fmtInt(safeArray(store.doc.chunks).length) +
+          ' real chunks, one call per chunk. Nothing leaves this machine, so there is no provider to hide ' +
+          'the document from and no synthetic decoys are generated.'
+        : 'Builds the batch from ' + fmtInt(safeArray(store.doc.chunks).length) +
+          ' real chunks plus synthetic decoys, then makes one provider call per fragment.') +
+        ' Progress is streamed live below — you will see every fragment as it is generated and every answer as it returns.</p>';
       html += runPlanHtml();
-      if (settings.has_api_key === false) {
+      if (!local && settings.has_api_key === false) {
         html += '<div class="alert alert-warn" style="margin:12px 0 0"><span class="alert-title">No API key</span> — ' +
           'detection needs an Anthropic key. <a href="#settings">Open Settings</a> to add one.</div>';
       }
@@ -1301,7 +1365,10 @@
       const detect = store.detect;
       const requests = safeArray(detect.requests);
       const results = safeArray(detect.results);
-      const provider = store.batchView === 'provider';
+      // Read from the run itself, not from the current setting: a run stays
+      // what it was even after the provider is switched in Settings.
+      const localRun = runIsLocal(detect);
+      const provider = store.batchView === 'provider' && !localRun;
 
       const resultById = new Map();
       results.forEach((result) => {
@@ -1324,17 +1391,24 @@
       html += compositionHtml(detect.composition);
 
       html += '<div class="row-between" style="margin:22px 0 0;align-items:center">';
-      html += '<h3 class="section-title" style="margin:0">Submitted fragments (' +
-        fmtInt(requests.length) + ', in submission order)</h3>';
-      html += '<div class="seg-toggle" role="group" aria-label="Fragment view">';
-      html += '<button type="button" class="seg-btn' + (provider ? '' : ' is-active') +
-        '" data-batchview="local" aria-pressed="' + (provider ? 'false' : 'true') + '">Local view</button>';
-      html += '<button type="button" class="seg-btn' + (provider ? ' is-active' : '') +
-        '" data-batchview="provider" aria-pressed="' + (provider ? 'true' : 'false') + '">Provider view' + info('provider') + '</button>';
-      html += '</div>';
+      html += '<h3 class="section-title" style="margin:0">' + (localRun
+        ? 'Fragments sent to the local model (' + fmtInt(requests.length) + ')'
+        : 'Submitted fragments (' + fmtInt(requests.length) + ', in submission order)') + '</h3>';
+      // A run with no provider has no provider view to switch to.
+      if (!localRun) {
+        html += '<div class="seg-toggle" role="group" aria-label="Fragment view">';
+        html += '<button type="button" class="seg-btn' + (provider ? '' : ' is-active') +
+          '" data-batchview="local" aria-pressed="' + (provider ? 'false' : 'true') + '">Local view</button>';
+        html += '<button type="button" class="seg-btn' + (provider ? ' is-active' : '') +
+          '" data-batchview="provider" aria-pressed="' + (provider ? 'true' : 'false') + '">Provider view' + info('provider') + '</button>';
+        html += '</div>';
+      }
       html += '</div>';
 
-      if (provider) {
+      if (localRun) {
+        html += '<div class="provider-caption">Every fragment below was answered by the model on this machine. ' +
+          'Nothing was sent to a provider, so there is nothing to shuffle it into and no decoys were generated.</div>';
+      } else if (provider) {
         html += '<div class="provider-caption">This is everything the provider can see: shuffled fragments under opaque IDs, ' +
           'roughly half of them synthetic, with no ordering and no labels.</div>';
       } else {
@@ -1528,6 +1602,9 @@
           raw_text: event.raw_text,
           latency_ms: event.latency_ms,
           detail: event.detail,
+          // Local runs only: names the verbatim guard threw away because the
+          // model invented them. Absent on the remote path.
+          dropped: event.dropped,
         };
         if (store.detect) {
           if (!Array.isArray(store.detect.results)) store.detect.results = [];
@@ -1539,6 +1616,7 @@
         let line = '  ' + num(event.index, 0) + '/' + num(event.total, 0) + ' ' +
           String(event.kind || '?') + ' ' + shortId(event.custom_id) + ' - ' + status +
           ', ' + result.entities.length + ' entities, ' + fmtSec(event.latency_ms);
+        if (num(event.dropped, 0) > 0) line += ', ' + num(event.dropped, 0) + ' dropped';
         if (event.detail) line += ' - ' + String(event.detail);
         logLine(cls, line);
 
@@ -1767,6 +1845,58 @@
       '</span><span class="ent-type ent-type-' + cls + '">' + esc(upper) + '</span></span>';
   }
 
+  /** The keys whose object value gets a friendlier heading than its own name. */
+  const TEMPLATE_SECTION_TITLES = {
+    system: 'System prompt',
+    output_config: 'Output schema',
+    response_format: 'Output schema',
+  };
+
+  /**
+   * Render whatever payload template the run reported, without assuming whose
+   * it is: the Anthropic one carries `model`/`max_tokens`/`output_config`, the
+   * local one `base_url`/`temperature`/`response_format`, and a future one
+   * something else again. Scalars become chips in payload order, objects (and
+   * the system prompt) become code blocks under their key's name.
+   */
+  function payloadTemplateHtml(template) {
+    const keys = Object.keys(template);
+
+    let chips = '';
+    keys.forEach((key) => {
+      const value = template[key];
+      if (key === 'system' || value === null || value === undefined) return;
+      if (typeof value === 'object') return;
+      const text = typeof value === 'number' && Number.isInteger(value) && Math.abs(value) >= 1000
+        ? fmtInt(value) : String(value);
+      chips += '<span class="chip"><span class="chip-k">' + esc(key) +
+        '</span><span class="chip-v">' + esc(text) + '</span></span>';
+    });
+    // Effort lives inside the Anthropic template's output_config; it means
+    // nothing on a transport that has no such dial, so it is not shown there.
+    if (template.output_config && store.settings && store.settings.effort) {
+      chips += '<span class="chip"><span class="chip-k">effort</span><span class="chip-v">' +
+        esc(store.settings.effort) + '</span>' + info('effort') + '</span>';
+    }
+
+    let html = '';
+    if (chips) html += '<div class="chips" style="margin-bottom:12px">' + chips + '</div>';
+
+    keys.forEach((key) => {
+      const value = template[key];
+      if (key !== 'system' && (typeof value !== 'object' || value === null)) return;
+      const title = TEMPLATE_SECTION_TITLES[key] || key;
+      html += '<h4>' + esc(title) + '</h4>';
+      if (key === 'system') {
+        html += '<pre class="code">' +
+          esc(typeof value === 'string' ? value : pretty(value)) + '</pre>';
+      } else {
+        html += '<pre class="code code-nowrap">' + esc(pretty(value)) + '</pre>';
+      }
+    });
+    return html;
+  }
+
   function renderLlm(root) {
     let html = '';
     html += '<div class="page-head">';
@@ -1843,6 +1973,13 @@
         fmtPct(recall.recall) + '</div><div class="stat-sub">' +
         fmtInt(recall.found) + ' / ' + fmtInt(recall.planted) + ' planted names found</div></div>';
     }
+    // Local runs only: the verbatim guard's tally. Reported whenever the run
+    // carries it, so a remote run (which never does) shows nothing new.
+    const droppedTotal = results.reduce((sum, result) => sum + num(result.dropped, 0), 0);
+    if (droppedTotal > 0) {
+      html += '<div class="stat"><div class="stat-k">Dropped' + info('dropped') + '</div><div class="stat-v stat-v-warn">' +
+        fmtInt(droppedTotal) + '</div><div class="stat-sub">hallucinated names thrown away</div></div>';
+    }
     html += '</div>';
 
     const template = detect.payload_template && typeof detect.payload_template === 'object'
@@ -1854,23 +1991,7 @@
     if (!template) {
       html += '<div class="empty-hint">No payload template returned.</div>';
     } else {
-      html += '<div class="chips" style="margin-bottom:12px">';
-      if (template.model) {
-        html += '<span class="chip"><span class="chip-k">model</span><span class="chip-v">' + esc(template.model) + '</span></span>';
-      }
-      if (template.max_tokens !== undefined && template.max_tokens !== null) {
-        html += '<span class="chip"><span class="chip-k">max_tokens</span><span class="chip-v">' + fmtInt(template.max_tokens) + '</span></span>';
-      }
-      if (store.settings && store.settings.effort) {
-        html += '<span class="chip"><span class="chip-k">effort</span><span class="chip-v">' +
-          esc(store.settings.effort) + '</span>' + info('effort') + '</span>';
-      }
-      html += '</div>';
-      html += '<h4>System prompt</h4>';
-      html += '<pre class="code">' +
-        esc(typeof template.system === 'string' ? template.system : pretty(template.system)) + '</pre>';
-      html += '<h4>Output schema</h4>';
-      html += '<pre class="code code-nowrap">' + esc(pretty(template.output_config)) + '</pre>';
+      html += payloadTemplateHtml(template);
     }
     html += '</div></details>';
 
@@ -1893,6 +2014,11 @@
         html += '<span class="mono dim">' + esc(customId) + '</span>';
         html += kindBadge(kind);
         html += statusPill(status);
+        const dropped = result ? num(result.dropped, 0) : 0;
+        if (dropped > 0) {
+          html += '<span class="mono dim" title="Names the model returned that are not in the ' +
+            'fragment verbatim, so they were thrown away">dropped ' + fmtInt(dropped) + '</span>';
+        }
         html += '<span class="io-latency">' +
           (result && result.latency_ms !== undefined && result.latency_ms !== null
             ? fmtInt(result.latency_ms) + ' ms' : '—') + '</span>';
@@ -1909,6 +2035,12 @@
             html += '<div class="ent-list">' + entities.map(entityHtml).join('') + '</div>';
           } else {
             html += '<div class="empty-hint" style="text-align:left;margin:0">No names returned for this fragment.</div>';
+          }
+          if (dropped > 0) {
+            html += '<div class="hint">' + fmtInt(dropped) + ' hallucinated ' +
+              (dropped === 1 ? 'name was' : 'names were') +
+              ' dropped — the model returned text that does not appear in this fragment.' +
+              info('dropped') + '</div>';
           }
           if (result.raw_text) {
             html += '<h4>Raw response</h4><pre class="code">' + esc(result.raw_text) + '</pre>';
@@ -2389,6 +2521,71 @@
     return html;
   }
 
+  // The two datalists that turn a "type the exact model id" field into a
+  // picker. Ids, not classes: an <input list="..."> can only name one.
+  const DETECTION_MODEL_OPTIONS = 'detection-model-options';
+  const LLM_MODEL_OPTIONS = 'llm-model-options';
+
+  /** An empty (or already known) datalist for a model field.
+   *
+   * Rendered from the cache so the suggestions survive a re-render; when the
+   * base URL has not been asked yet the list starts empty and is filled in
+   * place by `refreshModelOptions`, which never re-renders the form — a user
+   * halfway through editing another field must not lose what they typed.
+   */
+  function modelOptionsHtml(listId, baseUrl) {
+    const known = safeArray(store.localModels[modelCacheKey(baseUrl)]);
+    let html = '<datalist id="' + listId + '">';
+    known.forEach((model) => {
+      html += '<option value="' + esc(model) + '"></option>';
+    });
+    html += '</datalist>';
+    return html;
+  }
+
+  /** Cache key for one endpoint: an empty field means "whatever is configured". */
+  function modelCacheKey(baseUrl) {
+    return (baseUrl || '').trim();
+  }
+
+  /** Fill both model datalists from the base URLs currently in the form. */
+  function refreshModelOptions(root) {
+    refreshModelOptionsFor(root, DETECTION_MODEL_OPTIONS, '#f-detection-base');
+    refreshModelOptionsFor(root, LLM_MODEL_OPTIONS, '#f-base');
+  }
+
+  /** Ask the server at `baseSelector`'s URL what it serves, then fill `listId`.
+   *
+   * Silent by design: this is an affordance, not a check. A server that does
+   * not answer (very likely while its URL is still being typed) leaves the
+   * list empty and the field behaves exactly as it did before — the preflight
+   * on the same page is where an unreachable endpoint is actually reported.
+   */
+  async function refreshModelOptionsFor(root, listId, baseSelector) {
+    const baseNode = root.querySelector(baseSelector);
+    const key = modelCacheKey(baseNode ? baseNode.value : '');
+    if (!(key in store.localModels)) {
+      let payload = null;
+      try {
+        payload = await api('/api/detection/local-models' +
+          (key ? '?base_url=' + encodeURIComponent(key) : ''));
+      } catch (err) {
+        payload = null;
+      }
+      store.localModels[key] = safeArray(payload && payload.models);
+    }
+    fillModelOptions(root, listId, store.localModels[key]);
+  }
+
+  /** Write the offered ids into an already-rendered datalist. */
+  function fillModelOptions(root, listId, models) {
+    const list = root.querySelector('#' + listId);
+    if (!list) return;
+    list.innerHTML = safeArray(models)
+      .map((model) => '<option value="' + esc(model) + '"></option>')
+      .join('');
+  }
+
   /** The "Synthetic prose generator" picker: templates, catalogued models, custom. */
   function generatorChoiceHtml(settings) {
     const data = store.llmModels;
@@ -2435,8 +2632,10 @@
     html += '<div class="field" id="llm-custom-field"' +
       (choice === CHOICE_CUSTOM ? '' : ' hidden') + ' style="margin-top:10px">';
     html += '<label for="f-llm-model">Custom local model</label>';
-    html += '<input type="text" id="f-llm-model" name="llm_model" value="' +
-      esc(settings.llm_model || '') + '" placeholder="model id as the local server names it">';
+    html += '<input type="text" id="f-llm-model" name="llm_model" list="' + LLM_MODEL_OPTIONS +
+      '" value="' + esc(settings.llm_model || '') +
+      '" placeholder="model id as the local server names it">';
+    html += modelOptionsHtml(LLM_MODEL_OPTIONS, settings.llm_base_url);
     html += '</div>';
 
     html += '</div>';
@@ -2489,7 +2688,9 @@
       esc(keyPlaceholder) + '" autocomplete="new-password">';
     html += '<div class="hint">' + (settings.has_api_key
       ? 'A key is stored. Leave this empty to keep it unchanged.'
-      : 'No key stored. Detection will fail until a key is set.') + '</div>';
+      : (localDetection()
+        ? 'No key stored. Local detection does not need one; switching the detection provider back to anthropic does.'
+        : 'No key stored. Detection will fail until a key is set.')) + '</div>';
     html += '</div>';
 
     html += '<div class="field"><label for="f-model">Provider model</label>';
@@ -2515,6 +2716,13 @@
 
     html += '</div>';
 
+    html += '<h3 class="section-title">Detection</h3>';
+    html += '<p class="hint">Which backend answers the detection question, and where the local one lives. ' +
+      'Clear a field to fall back to the config-file default.</p>';
+    html += '<div class="form-grid">';
+    html += detectionFieldsHtml(settings);
+    html += '</div>';
+
     html += '<h3 class="section-title">Pipeline parameters</h3>';
     html += '<p class="hint">These parameters decide how many synthetic fragments — chaff, honeytokens ' +
       'and canaries — ride along with the real chunks in every batch. Clear a field to fall back to the ' +
@@ -2534,6 +2742,48 @@
 
     root.innerHTML = html;
     wireSettings(root);
+  }
+
+  /** Provider picker plus the two local-endpoint fields.
+   *
+   * Same contract as the llm_* fields: the value shown is the effective one
+   * (config default unless overridden), and saving an empty field clears the
+   * override rather than storing an empty endpoint.
+   */
+  function detectionFieldsHtml(settings) {
+    const providers = DETECTION_PROVIDERS.slice();
+    const current = settings.detection_provider || '';
+    if (current && !providers.includes(current)) providers.unshift(current);
+
+    let html = '<div class="field" style="grid-column:1/-1">';
+    html += '<label for="f-detection-provider">Detection provider' + info('detection_provider') + '</label>';
+    html += '<select id="f-detection-provider" name="detection_provider">';
+    providers.forEach((value) => {
+      html += '<option value="' + esc(value) + '"' + (current === value ? ' selected' : '') +
+        '>' + esc(value) + '</option>';
+    });
+    html += '</select>';
+    html += '<div class="hint">Local mode sends nothing to Anthropic and disables synthetic mixing for ' +
+      'detection runs — no honeytokens, no chaff, no canaries, so there is no recall figure either.</div>';
+    html += '</div>';
+
+    html += '<div class="field"><label for="f-detection-base">Local detection base URL</label>';
+    html += '<input type="text" id="f-detection-base" name="detection_local_base_url" value="' +
+      esc(settings.detection_local_base_url || '') +
+      '" placeholder="OpenAI-compatible endpoint of the local server"></div>';
+
+    html += '<div class="field"><label for="f-detection-model">Local detection model</label>';
+    html += '<input type="text" id="f-detection-model" name="detection_local_model" list="' +
+      DETECTION_MODEL_OPTIONS + '" value="' +
+      esc(settings.detection_local_model || '') +
+      '" placeholder="model id as the local server names it">';
+    // Suggestions only: the id has to match the server's own spelling, which
+    // nobody can guess, but a server may serve models it does not list, so the
+    // field stays free text.
+    html += modelOptionsHtml(DETECTION_MODEL_OPTIONS, settings.detection_local_base_url);
+    html += '</div>';
+
+    return html;
   }
 
   // One entry per tunable pipeline parameter, in the order they are rendered.
@@ -2636,6 +2886,21 @@
     const verify = root.querySelector('#run-verify');
     if (verify) verify.addEventListener('click', () => runVerify());
 
+    // Offer the model ids the local servers actually serve, and follow the
+    // base URL fields: pointing at another server must re-ask that server,
+    // never re-offer the previous one's models. `change` (not `input`) so a
+    // half-typed URL is not asked about on every keystroke.
+    refreshModelOptions(root);
+    [
+      { base: '#f-detection-base', list: DETECTION_MODEL_OPTIONS },
+      { base: '#f-base', list: LLM_MODEL_OPTIONS },
+    ].forEach((pair) => {
+      const node = root.querySelector(pair.base);
+      if (node) {
+        node.addEventListener('change', () => refreshModelOptionsFor(root, pair.list, pair.base));
+      }
+    });
+
     const reload = root.querySelector('#reload-settings');
     if (reload) {
       reload.addEventListener('click', async () => {
@@ -2672,6 +2937,9 @@
         const effortNode = root.querySelector('#f-effort');
         const baseNode = root.querySelector('#f-base');
         const conversionNode = root.querySelector('#f-conversion');
+        const providerNode = root.querySelector('#f-detection-provider');
+        const detectBaseNode = root.querySelector('#f-detection-base');
+        const detectModelNode = root.querySelector('#f-detection-model');
         const llmModelNode = root.querySelector('#f-llm-model');
         const pickedNode = root.querySelector('input[name="llm-choice"]:checked');
         const keyNode = root.querySelector('#f-key');
@@ -2683,6 +2951,11 @@
           // Always sent, empty included: an empty field is the user choosing
           // the built-in converter, not a field they left alone.
           conversion_service_url: conversionNode ? (conversionNode.value || '').trim() : '',
+          // Same convention as the llm_* fields: the value shown was the
+          // effective one, so an emptied field means "clear my override".
+          detection_provider: providerNode ? providerNode.value : '',
+          detection_local_base_url: detectBaseNode ? (detectBaseNode.value || '').trim() : '',
+          detection_local_model: detectModelNode ? (detectModelNode.value || '').trim() : '',
         };
 
         // Templates leave llm_model alone: the model a user picked earlier is
@@ -2778,6 +3051,9 @@
     // Configuration changed, so the previous verdict and the availability of
     // the offered models (the base URL may have moved) are both stale.
     store.llmModels = null;
+    // Same reason, plus the cheap way to re-ask a server that was down while
+    // the user was configuring it: save the form and the lists are asked again.
+    store.localModels = {};
     fetchLlmModels();
     runVerify();
   }

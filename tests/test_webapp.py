@@ -28,6 +28,12 @@ from fastapi.testclient import TestClient
 
 from doc_quant.config import ConfigError, load_config
 from doc_quant.detector import DETECTION_SYSTEM_PROMPT, ENTITY_SCHEMA
+from doc_quant.local_detector import (
+    build_local_payload_template,
+    build_local_request,
+    get_local_client,
+)
+from doc_quant.local_llm import LocalLLMError
 from doc_quant.store import ChunkStore
 from doc_quant.synthetic import (
     CANARY_FACT_TEMPLATE,
@@ -2023,6 +2029,134 @@ def test_llm_models_follows_the_configured_base_url_override(harness):
 
 
 # ---------------------------------------------------------------------------
+# local detection models
+# ---------------------------------------------------------------------------
+
+
+def local_detection_models(harness: Harness, base_url: str | None = None) -> dict:
+    """Ask the endpoint what the local detection server serves."""
+    path = "/api/detection/local-models"
+    if base_url is not None:
+        path += f"?base_url={base_url}"
+    response = harness.client.get(path)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_local_detection_models_lists_the_served_ids_sorted(harness):
+    config = load_config()
+    harness.http.serve(["qwen2.5:7b", "gemma3:4b", "llama3.2:1b"])
+
+    payload = local_detection_models(harness)
+
+    # Sorted, because the field they feed is a picker: the order the server
+    # happens to answer in is not a ranking the user should have to read.
+    assert payload["models"] == ["gemma3:4b", "llama3.2:1b", "qwen2.5:7b"]
+    assert "detail" not in payload
+    assert harness.http.requested == [f"{config.detection.local.base_url}/models"]
+
+
+def test_local_detection_models_honours_the_base_url_query_parameter(harness):
+    harness.http.serve(["typed-model"])
+
+    payload = local_detection_models(harness, base_url="http://typed:9999/v1/")
+
+    # The parameter is what lets the settings form list models for a URL the
+    # user has typed but not saved yet.
+    assert payload["models"] == ["typed-model"]
+    assert harness.http.requested == ["http://typed:9999/v1/models"]
+
+
+def test_local_detection_models_follows_the_saved_base_url_override(harness):
+    harness.client.put(
+        "/api/settings", json={"detection_local_base_url": "http://saved:1234/v1"}
+    )
+    harness.http.requested.clear()
+    harness.http.serve(["saved-model"])
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == ["saved-model"]
+    assert harness.http.requested == ["http://saved:1234/v1/models"]
+
+
+def test_local_detection_models_reports_an_unreachable_server_without_failing(harness):
+    harness.http.error = httpx.ConnectError("connection refused")
+
+    payload = local_detection_models(harness)
+
+    # A server that does not answer while the user is still typing its URL is
+    # a normal state the picker degrades through, not an error worth a status.
+    assert payload["models"] == []
+    assert "connection refused" in payload["detail"]
+
+
+def test_local_detection_models_reports_an_error_response_without_failing(harness):
+    harness.http.serve([], status_code=503)
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == []
+    assert "503" in payload["detail"]
+
+
+def test_local_detection_models_survives_an_unparsable_payload(harness):
+    harness.http.error = None
+    harness.http.response = SimpleNamespace(
+        status_code=200, json=lambda: {"models": ["not-the-openai-shape"]}
+    )
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == []
+    assert payload["detail"]
+
+
+def test_local_detection_models_skips_entries_without_a_string_id(harness):
+    harness.http.error = None
+    harness.http.response = SimpleNamespace(
+        status_code=200,
+        json=lambda: {
+            "data": [
+                {"id": "good-model"},
+                {"id": 17},
+                {"object": "model"},
+                "not-a-dict",
+                {"id": ""},
+            ]
+        },
+    )
+
+    payload = local_detection_models(harness)
+
+    # An odd entry costs its own id, never the whole list: half a picker still
+    # beats none.
+    assert payload["models"] == ["good-model"]
+
+
+def test_local_detection_models_needs_no_store(harness, monkeypatch):
+    def unusable(config) -> None:
+        raise AssertionError("the models endpoint must not touch the store")
+
+    monkeypatch.setattr(server, "get_store", unusable)
+    harness.http.serve(["qwen2.5:7b"])
+
+    payload = local_detection_models(harness)
+
+    assert payload["models"] == ["qwen2.5:7b"]
+
+
+def test_local_detection_models_uses_the_short_preflight_timeout(harness):
+    harness.http.timeouts.clear()
+    harness.http.serve(["qwen2.5:7b"])
+
+    local_detection_models(harness)
+
+    # A typing-time affordance must never hang on the detection timeout.
+    assert harness.http.timeouts == [server.VERIFY_HTTP_TIMEOUT_SECONDS]
+
+
+# ---------------------------------------------------------------------------
 # canary probe
 # ---------------------------------------------------------------------------
 
@@ -2113,3 +2247,328 @@ def test_settings_model_override_reaches_the_detection_payload(harness):
     assert result["payload_template"]["model"] == "claude-override"
     assert result["payload_template"]["output_config"]["effort"] == "high"
     assert all(call["model"] == "claude-override" for call in harness.provider.calls)
+
+
+# ---------------------------------------------------------------------------
+# local detection provider
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LocalBackend:
+    """What the fake local model server saw, and what it was told to answer."""
+
+    payloads: list[dict] = field(default_factory=list)
+    entities_by_text: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+
+
+def use_local_detection(harness: Harness, monkeypatch) -> LocalBackend:
+    """Switch the app to the local provider and stub the model server.
+
+    The provider is flipped through the real settings endpoint rather than by
+    patching the config, so the test covers the same route a user takes. The
+    local client is the real `LocalLLMClient` over an `httpx.MockTransport`,
+    so the wire payload the app builds is exercised end to end while nothing
+    leaves the process.
+
+    Local mode must never touch the Anthropic client or the synthetic
+    generator, so both factories are replaced by ones that fail loudly.
+    """
+    answer = harness.client.put("/api/settings", json={"detection_provider": "local"})
+    assert answer.status_code == 200, answer.text
+
+    backend = LocalBackend()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        backend.payloads.append(payload)
+        text = payload["messages"][-1]["content"]
+        entities = backend.entities_by_text.get(text)
+        if entities is None:
+            entities = [
+                (name, kind) for name, kind in KNOWN_ENTITIES if name in text
+            ]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "entities": [
+                                        {"text": name, "type": kind}
+                                        for name, kind in entities
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(server, "probe_local_server", lambda config: None)
+    monkeypatch.setattr(
+        server,
+        "get_local_detection_client",
+        lambda config: get_local_client(config, transport=transport),
+    )
+
+    def no_anthropic(api_key):
+        raise AssertionError("local detection must not build an Anthropic client")
+
+    def no_generator(config, store):
+        raise AssertionError("local detection must not build a synthetic generator")
+
+    monkeypatch.setattr(server, "get_anthropic_client", no_anthropic)
+    monkeypatch.setattr(server, "get_generator", no_generator)
+    return backend
+
+
+def test_settings_carry_detection_fields(harness):
+    config = load_config()
+
+    payload = harness.client.get("/api/settings").json()
+
+    assert payload["detection_provider"] == config.detection.provider
+    assert payload["detection_local_base_url"] == config.detection.local.base_url
+    assert payload["detection_local_model"] == config.detection.local.model
+    # The endpoint is not a pipeline parameter, so it stays out of the
+    # "default: X" block the frontend renders next to those.
+    assert "detection_provider" not in payload["pipeline_defaults"]
+
+
+def test_settings_accept_provider_update(harness):
+    answer = harness.client.put("/api/settings", json={"detection_provider": "local"})
+
+    assert answer.status_code == 200
+    assert answer.json()["detection_provider"] == "local"
+    assert harness.client.get("/api/settings").json()["detection_provider"] == "local"
+
+
+def test_settings_accept_local_endpoint_update(harness):
+    answer = harness.client.put(
+        "/api/settings",
+        json={
+            "detection_local_base_url": "http://localhost:9/v1",
+            "detection_local_model": "tiny-detector",
+        },
+    )
+
+    assert answer.status_code == 200
+    payload = answer.json()
+    assert payload["detection_local_base_url"] == "http://localhost:9/v1"
+    assert payload["detection_local_model"] == "tiny-detector"
+    # Repointing the endpoint says nothing about which backend is in use.
+    assert payload["detection_provider"] == load_config().detection.provider
+
+
+def test_settings_reject_unknown_provider(harness):
+    answer = harness.client.put("/api/settings", json={"detection_provider": "remote"})
+
+    assert answer.status_code == 400
+    assert harness.client.get("/api/settings").json()["detection_provider"] == "anthropic"
+
+
+def test_local_detect_streams_and_stores(harness, monkeypatch):
+    backend = use_local_detection(harness, monkeypatch)
+    document = upload_markdown(harness)
+
+    events = detect_events(harness, document["doc_id"])
+
+    types = [event["type"] for event in events]
+    assert types[0] == "phase"
+    assert "synthetic" not in types
+
+    submitted = next(event for event in events if event["type"] == "submitted")
+    assert submitted["batch_id"].startswith("local-")
+    assert submitted["composition"] == {"real": len(submitted["requests"])}
+    assert all(item["kind"] == "real" for item in submitted["requests"])
+    # No shuffle in local mode: nothing leaves the machine, so document order
+    # is the more watchable one.
+    assert [item["seq"] for item in submitted["requests"]] == sorted(
+        item["seq"] for item in submitted["requests"]
+    )
+    assert [item["custom_id"] for item in submitted["requests"]] == [
+        chunk["chunk_id"] for chunk in document["chunks"]
+    ]
+
+    template = submitted["payload_template"]
+    assert template == build_local_payload_template(load_config())
+    assert template["base_url"]
+
+    results = [event for event in events if event["type"] == "result"]
+    assert len(results) == len(document["chunks"])
+    assert all(result["status"] == "ok" for result in results)
+    assert all(result["dropped"] == 0 for result in results)
+    assert all(result["latency_ms"] >= 0 for result in results)
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["honeytoken_recall"] is None
+    assert done["entities_stored"] >= 1
+    assert done["payload_template"] == template
+    assert done["batch_id"] == submitted["batch_id"]
+
+    # Every fragment went to the local server as the shared builder renders it.
+    assert len(backend.payloads) == len(document["chunks"])
+    for payload in backend.payloads:
+        text = payload["messages"][-1]["content"]
+        assert payload == build_local_request(template, text)
+
+    store = harness.store()
+    try:
+        stored = store.get_document_entities(document["doc_id"])
+        assert ("Jan Novak", "person") in stored
+    finally:
+        store.close()
+
+    assert harness.provider.calls == []
+
+
+def test_local_detect_needs_no_api_key(harness, monkeypatch):
+    use_local_detection(harness, monkeypatch)
+    harness.client.put("/api/settings", json={"anthropic_api_key": ""})
+    assert harness.client.get("/api/settings").json()["has_api_key"] is False
+    document = upload_markdown(harness)
+
+    response = harness.client.post("/api/detect", json={"doc_id": document["doc_id"]})
+
+    assert response.status_code == 200
+    assert json.loads(response.text.splitlines()[-1])["type"] == "done"
+
+
+def test_local_detect_makes_no_synthetics(harness, monkeypatch):
+    use_local_detection(harness, monkeypatch)
+    document = upload_markdown(harness)
+
+    detect_events(harness, document["doc_id"])
+
+    store = harness.store()
+    try:
+        assert store.list_synthetic_fragments() == []
+    finally:
+        store.close()
+    assert harness.fragments == []
+
+
+def test_local_detect_503_when_server_down(harness, monkeypatch):
+    use_local_detection(harness, monkeypatch)
+    document = upload_markdown(harness)
+
+    def dead(config):
+        raise LocalLLMError("Local detection server unreachable at http://x: nope")
+
+    monkeypatch.setattr(server, "probe_local_server", dead)
+
+    response = harness.client.post("/api/detect", json={"doc_id": document["doc_id"]})
+
+    assert response.status_code == 503
+    assert "unreachable" in response.json()["detail"]
+
+    # Nothing was written: the document must be exactly as it was.
+    store = harness.store()
+    try:
+        chunks = store.get_document_chunks(document["doc_id"])
+        assert chunks
+        assert all(chunk["batch_id"] is None for chunk in chunks)
+        assert store.list_batches() == []
+    finally:
+        store.close()
+
+
+def test_stored_run_view_renders_local_batch(harness, monkeypatch):
+    use_local_detection(harness, monkeypatch)
+    document = upload_markdown(harness)
+    doc_id = document["doc_id"]
+    detect_events(harness, doc_id)
+
+    run = stored_run(harness, doc_id)
+
+    assert run["has_run"] is True
+    assert run["chunks_submitted"] == len(document["chunks"])
+    assert [batch["batch_id"] for batch in run["batches"]] == [
+        run["batches"][0]["batch_id"]
+    ]
+    assert run["batches"][0]["batch_id"].startswith("local-")
+    assert run["batches"][0]["status"] == "sync-completed"
+    assert run["composition"]["real"] == len(document["chunks"])
+    assert all(run["composition"][kind] == 0 for kind in ("honeytoken", "chaff", "canary"))
+    assert run["honeytoken_recall"] is None
+    assert run["entities_stored"] >= 1
+
+    redaction = harness.client.get(f"/api/documents/{doc_id}/redaction").json()
+    assert redaction["has_detection"] is True
+    assert "Jan Novak" not in redaction["redacted"]
+
+
+def test_local_detect_reports_a_bad_answer_per_fragment(harness, monkeypatch):
+    """One unusable answer is an errored fragment, not a broken run."""
+    backend = use_local_detection(harness, monkeypatch)
+    document = upload_markdown(harness)
+    broken = document["chunks"][0]["text"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        backend.payloads.append(payload)
+        if payload["messages"][-1]["content"] == broken:
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "not json"}}]}
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps({"entities": []})}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        server,
+        "get_local_detection_client",
+        lambda config: get_local_client(config, transport=transport),
+    )
+
+    events = detect_events(harness, document["doc_id"])
+
+    done = events[-1]
+    assert done["type"] == "done"
+    statuses = {result["custom_id"]: result["status"] for result in done["results"]}
+    assert statuses[document["chunks"][0]["chunk_id"]] == "error"
+    assert all(
+        status == "ok"
+        for chunk_id, status in statuses.items()
+        if chunk_id != document["chunks"][0]["chunk_id"]
+    )
+    assert done["entities_stored"] == 0
+
+
+def test_local_detect_drops_hallucinated_names(harness, monkeypatch):
+    backend = use_local_detection(harness, monkeypatch)
+    document = upload_markdown(harness)
+    for chunk in document["chunks"]:
+        backend.entities_by_text[chunk["text"]] = [("Elvira Ghost", "person")]
+
+    events = detect_events(harness, document["doc_id"])
+
+    done = events[-1]
+    assert done["entities_stored"] == 0
+    assert sum(result["dropped"] for result in done["results"]) == len(
+        document["chunks"]
+    )
+    store = harness.store()
+    try:
+        assert store.get_document_entities(document["doc_id"]) == []
+    finally:
+        store.close()
+
+
+def test_anthropic_provider_stays_the_default(harness):
+    """The remote path must be untouched by the local branch existing."""
+    document = upload_markdown(harness)
+    arm_provider(harness, document)
+
+    result = detect(harness, document["doc_id"])
+
+    assert result["batch_id"].startswith("sync-")
+    assert harness.provider.calls

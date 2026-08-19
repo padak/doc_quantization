@@ -34,9 +34,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import httpx
-
 from doc_quant.config import AppConfig
+
+# `LocalLLMClient` is used below; `LocalLLMError` is imported purely to keep it
+# re-exported. The client moved to its own module once local detection needed
+# it too, and `doc_quant.synthetic` stays a valid import path for both names so
+# existing callers (the CLI, the tests) are unaffected. Do not "clean up" the
+# seemingly unused name.
+from doc_quant.local_llm import LocalLLMClient, LocalLLMError  # noqa: F401
 
 if TYPE_CHECKING:  # pragma: no cover - import for type checkers only
     from doc_quant.store import ChunkStore
@@ -82,95 +87,6 @@ class SyntheticFragment:
     text: str
     planted: list[tuple[str, str]]
     fact: str | None
-
-
-class LocalLLMError(Exception):
-    """Raised when the local OpenAI-compatible endpoint cannot be used."""
-
-
-class LocalLLMClient:
-    """Minimal client for an OpenAI-compatible `/chat/completions` endpoint.
-
-    Deliberately tiny: only the one call this module needs, so that any server
-    speaking the protocol (Ollama, LM Studio, llama.cpp) works without a
-    vendor SDK.
-    """
-
-    def __init__(
-        self,
-        base_url: str,
-        model: str,
-        temperature: float,
-        timeout_seconds: float,
-        *,
-        transport: httpx.BaseTransport | None = None,
-    ) -> None:
-        """Configure the endpoint.
-
-        Args:
-            base_url: OpenAI-compatible root, e.g. http://localhost:11434/v1.
-            model: model name as the local server knows it.
-            temperature: sampling temperature for the prose.
-            timeout_seconds: per-request timeout.
-            transport: optional httpx transport override; tests use it to stay
-                offline, production leaves it at None.
-        """
-        self._base_url = base_url.rstrip("/")
-        self._model = model
-        self._temperature = temperature
-        self._timeout_seconds = timeout_seconds
-        self._transport = transport
-
-    def generate(self, prompt: str, seed: int) -> str:
-        """Return the assistant message for `prompt`, sampled with `seed`.
-
-        Raises:
-            LocalLLMError: when the server is unreachable, times out, answers
-                with a non-200 status, or returns an unusable payload.
-        """
-        url = f"{self._base_url}/chat/completions"
-        payload = {
-            "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": self._temperature,
-            "seed": seed,
-            "stream": False,
-        }
-
-        try:
-            with httpx.Client(
-                transport=self._transport, timeout=self._timeout_seconds
-            ) as client:
-                response = client.post(url, json=payload)
-        except httpx.ConnectError as exc:
-            raise self._unusable(f"connection refused ({exc})") from exc
-        except httpx.TimeoutException as exc:
-            raise self._unusable(
-                f"no answer within {self._timeout_seconds}s ({exc})"
-            ) from exc
-
-        if response.status_code != 200:
-            raise self._unusable(f"HTTP {response.status_code}")
-
-        try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise self._unusable(f"unexpected response payload ({exc})") from exc
-
-        if not isinstance(content, str):
-            raise self._unusable(
-                f"expected string content, got {type(content).__name__}"
-            )
-        return content
-
-    def _unusable(self, detail: str) -> LocalLLMError:
-        """Build an error that says what to do about it, not just what broke."""
-        return LocalLLMError(
-            f"Local LLM server unreachable at {self._base_url}: {detail}. "
-            f"Start one, e.g. Ollama (`ollama serve`, `ollama pull {self._model}`) "
-            "or LM Studio, or change synthetic.llm.base_url in config/config.json."
-        )
 
 
 # Syllable parts. Assembled names read like plausible European surnames and

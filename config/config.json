@@ -16,6 +16,15 @@
     "max_tokens": 1024,
     "detect_concurrency": 6
   },
+  "detection": {
+    "provider": "anthropic",
+    "local": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "qwen2.5:7b",
+      "timeout_seconds": 120,
+      "concurrency": 2
+    }
+  },
   "redaction": {
     "person": "**PERSON**",
     "company": "**COMPANY**",

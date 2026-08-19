@@ -18,13 +18,16 @@ import pytest
 
 from doc_quant.config import (
     DEFAULT_CONFIG_PATH,
+    DETECTION_PROVIDER_ANTHROPIC,
     AnthropicConfig,
     AppConfig,
     ChunkingConfig,
     ConfigError,
     ConversionConfig,
     DatabaseConfig,
+    DetectionConfig,
     LLMCatalogEntry,
+    LocalDetectionConfig,
     RedactionConfig,
     SyntheticConfig,
     SyntheticLLMConfig,
@@ -98,6 +101,18 @@ def make_config(tmp_path: Path, **synthetic_overrides) -> AppConfig:
         conversion=ConversionConfig(service_url=""),
         anthropic=AnthropicConfig(
             model="claude-opus-5", effort="low", max_tokens=1024, detect_concurrency=6
+        ),
+        # The synthetic pipeline never consults this section, but AppConfig is
+        # whole-or-nothing: leaving it out would only prove the dataclass
+        # requires it.
+        detection=DetectionConfig(
+            provider=DETECTION_PROVIDER_ANTHROPIC,
+            local=LocalDetectionConfig(
+                base_url=BASE_URL,
+                model=MODEL,
+                timeout_seconds=5.0,
+                concurrency=2,
+            ),
         ),
         redaction=RedactionConfig(
             person="**PERSON**",
