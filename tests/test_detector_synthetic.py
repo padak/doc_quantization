@@ -8,6 +8,7 @@ only the contract between them and the detector is exercised here.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -34,6 +35,8 @@ from doc_quant.detector import (
 MODEL = "claude-opus-5"
 EFFORT = "low"
 MAX_TOKENS = 1024
+# The canary probe sends its questions this many at a time.
+DETECT_CONCURRENCY = 6
 
 HONEYTOKEN_RATE = 0.02
 CHAFF_RATIO = 1.0
@@ -56,7 +59,12 @@ def make_config(
             encoding="cl100k_base",
             name_run_max_extension_tokens=12,
         ),
-        anthropic=SimpleNamespace(model=MODEL, effort=EFFORT, max_tokens=MAX_TOKENS),
+        anthropic=SimpleNamespace(
+            model=MODEL,
+            effort=EFFORT,
+            max_tokens=MAX_TOKENS,
+            detect_concurrency=DETECT_CONCURRENCY,
+        ),
         synthetic=SimpleNamespace(
             honeytokens_enabled=honeytokens_enabled,
             chaff_enabled=chaff_enabled,
@@ -644,6 +652,11 @@ def test_fetch_discards_failed_chaff_and_canary_results_too():
 CANARY_NAME = "Milada Vrbova"
 CANARY_FACT = "Milada Vrbova ran the annual regatta at Zbrusnovice."
 CANARY_NONCE = "Zbrusnovice"
+# One fact per canary, each carrying a nonce of its own.
+CANARY_FACT_PATTERN = "{name}{index} ran the annual regatta at Zbrusnovice{index}."
+# How long a concurrent probe may take to gather all its questions before the
+# test gives up and reports the run as sequential.
+BARRIER_TIMEOUT_SECONDS = 5
 
 
 def canary_store(fact: str | None = CANARY_FACT, planted=None) -> FakeStore:
@@ -657,6 +670,46 @@ def canary_store(fact: str | None = CANARY_FACT, planted=None) -> FakeStore:
             }
         }
     )
+
+
+def many_canaries_store(count: int) -> FakeStore:
+    """A store holding `count` probeable canaries, each with its own nonce."""
+    return FakeStore(
+        synthetic={
+            f"canary-{index}": {
+                "kind": KIND_CANARY,
+                "text": CANARY_FACT_PATTERN.format(name=CANARY_NAME, index=index),
+                "planted": [(f"{CANARY_NAME}{index}", "person")],
+                "fact": CANARY_FACT_PATTERN.format(name=CANARY_NAME, index=index),
+            }
+            for index in range(count)
+        }
+    )
+
+
+class BarrierProbeClient:
+    """Answers each question only once `parties` of them are in flight.
+
+    It stands in for both the client and its `messages` namespace, so a probe
+    that ran its calls sequentially would block on the barrier until it times
+    out rather than quietly passing.
+    """
+
+    def __init__(self, parties: int, text: str) -> None:
+        self.messages = self
+        self.calls: list[dict] = []
+        self._barrier = threading.Barrier(parties, timeout=BARRIER_TIMEOUT_SECONDS)
+        self._lock = threading.Lock()
+        self._text = text
+
+    def create(self, **kwargs) -> SimpleNamespace:
+        with self._lock:
+            self.calls.append(kwargs)
+        self._barrier.wait()
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=self._text)],
+        )
 
 
 class FakeMessages:
@@ -792,6 +845,24 @@ def test_canary_probe_skips_a_canary_without_a_planted_person():
 
     assert run_canary_probe(make_config(), store, FakeProbeClient(messages)) == []
     assert store.canary_probes == []
+
+
+def test_canary_probe_runs_its_questions_concurrently():
+    # The client answers only once `DETECT_CONCURRENCY` questions are in
+    # flight at the same moment: probing one after another could never clear
+    # the barrier, so this both proves the concurrency and pins the worker
+    # count to the configured one.
+    store = many_canaries_store(DETECT_CONCURRENCY)
+    client = BarrierProbeClient(DETECT_CONCURRENCY, "I have never heard of them.")
+
+    results = run_canary_probe(make_config(), store, client)
+
+    assert len(client.calls) == DETECT_CONCURRENCY
+    expected = {f"canary-{index}" for index in range(DETECT_CONCURRENCY)}
+    assert {result["fragment_id"] for result in results} == expected
+    # Every verdict is written back on the calling thread, none is lost.
+    assert {probe[0] for probe in store.canary_probes} == expected
+    assert all(result["tripped"] is False for result in results)
 
 
 def test_canary_probe_ignores_non_canary_fragments():

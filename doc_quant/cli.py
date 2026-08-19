@@ -19,6 +19,7 @@ import argparse
 import logging
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -242,6 +243,8 @@ def _cmd_redact(args: argparse.Namespace, store: ChunkStore, config) -> int:
             entities,
             config.redaction.person,
             config.redaction.company,
+            email_placeholder=config.redaction.email,
+            url_placeholder=config.redaction.url,
         )
         output_path = output_dir / Path(document["path"]).with_suffix(REDACTED_SUFFIX)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,14 +466,22 @@ def run_canary_probe(
 ) -> list[dict]:
     """Probe every stored canary and record each verdict.
 
-    Returns one result dict per probed canary: fragment_id, model, tripped,
-    excerpt, name and nonce. Canaries without a planted person name or without
-    a testable fact are skipped with a warning, since their answer could not be
-    judged either way.
+    Returns one result dict per probed canary, in the order the answers came
+    back: fragment_id, model, tripped, excerpt, name and nonce. Canaries
+    without a planted person name or without a testable fact are skipped with a
+    warning, since their answer could not be judged either way.
+
+    The probes run `anthropic.detect_concurrency` at a time - a canary set is
+    tens of independent questions, and asking them one after another is minutes
+    of waiting for nothing. A worker only sends a question and times the
+    answer; every `record_canary_probe` write happens back on this thread,
+    because the store's SQLite connection belongs to the thread that opened it.
+    The Anthropic client is shared: the SDK's client is safe to send requests
+    from several threads.
     """
     model_used = model or config.anthropic.model
-    results: list[dict] = []
 
+    planned: list[tuple[str, str, str]] = []
     for canary in store.list_synthetic_fragments(kind=KIND_CANARY):
         fragment_id = canary["fragment_id"]
         planted = canary["planted"] or []
@@ -483,19 +494,39 @@ def run_canary_probe(
                 fragment_id,
             )
             continue
+        planned.append((fragment_id, name, nonce))
 
-        tripped, excerpt = _probe_canary_name(config, client, model_used, name, nonce)
-        store.record_canary_probe(fragment_id, model_used, tripped, excerpt)
-        results.append(
-            {
-                "fragment_id": fragment_id,
-                "model": model_used,
-                "tripped": tripped,
-                "excerpt": excerpt,
-                "name": name,
-                "nonce": nonce,
-            }
-        )
+    if not planned:
+        return []
+
+    results: list[dict] = []
+    workers = max(1, config.anthropic.detect_concurrency)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(
+                _probe_canary_name, config, client, model_used, name, nonce
+            ): (fragment_id, name, nonce)
+            for fragment_id, name, nonce in planned
+        }
+        for future in as_completed(futures):
+            fragment_id, name, nonce = futures[future]
+            tripped, excerpt = future.result()
+            store.record_canary_probe(fragment_id, model_used, tripped, excerpt)
+            results.append(
+                {
+                    "fragment_id": fragment_id,
+                    "model": model_used,
+                    "tripped": tripped,
+                    "excerpt": excerpt,
+                    "name": name,
+                    "nonce": nonce,
+                }
+            )
+    finally:
+        # A caller that gives up must not keep the run going: whatever is still
+        # queued is dropped rather than waited for.
+        pool.shutdown(wait=False, cancel_futures=True)
     return results
 
 

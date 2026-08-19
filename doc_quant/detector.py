@@ -30,6 +30,7 @@ import json
 import logging
 import random
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 import anthropic
@@ -72,6 +73,52 @@ ENTITY_SCHEMA = {
 VALID_ENTITY_TYPES = frozenset({"person", "company"})
 
 BATCH_STATUS_FETCHED = "fetched"
+
+
+def plan_synthetic_fragments(
+    config: AppConfig,
+    get_generator: Callable[[], Any],
+    real_count: int,
+) -> list[Any]:
+    """Generate the synthetic fragments that ride along with `real_count` chunks.
+
+    The mixing math lives here rather than inside `Detector` so that any other
+    transport - the batch path below, or a synchronous per-fragment path - mixes
+    a submission the exact same way. Every fragment returned is already
+    registered in the store by the generator, so a later result can be
+    recognised as synthetic.
+
+    Args:
+        config: the loaded application config; `config.synthetic` decides the
+            counts and which mechanisms are on.
+        get_generator: callable returning the `SyntheticGenerator`. A callable
+            rather than the generator itself so that a submission with every
+            synthetic feature switched off never builds one.
+        real_count: how many real chunks the submission carries.
+    """
+    synthetic_config = config.synthetic
+    fragments: list[Any] = []
+
+    if synthetic_config.honeytokens_enabled:
+        # At least one honeytoken per batch, otherwise small batches would
+        # never be measured at all.
+        count = max(1, round(real_count * synthetic_config.honeytoken_rate))
+        fragments.extend(get_generator().make_honeytokens(count))
+
+    if synthetic_config.chaff_enabled:
+        count = round(real_count * synthetic_config.chaff_ratio)
+        if count > 0:
+            fragments.extend(get_generator().make_chaff(count))
+
+    if synthetic_config.canaries_enabled:
+        # The canary set is persistent; each batch carries a random sample
+        # of it so that no single batch exposes the whole set.
+        canaries = get_generator().ensure_canaries()
+        sample_size = min(synthetic_config.canaries_per_batch, len(canaries))
+        if sample_size > 0:
+            fragments.extend(random.sample(canaries, sample_size))
+
+    return fragments
 
 
 class Detector:
@@ -134,34 +181,10 @@ class Detector:
         )
 
     def _make_synthetic_fragments(self, real_count: int) -> list[Any]:
-        """Generate the synthetic fragments that ride along with `real_count` chunks.
-
-        Every fragment returned here is already registered in the store by the
-        generator, so a later result can be recognised as synthetic.
-        """
-        synthetic_config = self._config.synthetic
-        fragments: list[Any] = []
-
-        if synthetic_config.honeytokens_enabled:
-            # At least one honeytoken per batch, otherwise small batches would
-            # never be measured at all.
-            count = max(1, round(real_count * synthetic_config.honeytoken_rate))
-            fragments.extend(self._get_generator().make_honeytokens(count))
-
-        if synthetic_config.chaff_enabled:
-            count = round(real_count * synthetic_config.chaff_ratio)
-            if count > 0:
-                fragments.extend(self._get_generator().make_chaff(count))
-
-        if synthetic_config.canaries_enabled:
-            # The canary set is persistent; each batch carries a random sample
-            # of it so that no single batch exposes the whole set.
-            canaries = self._get_generator().ensure_canaries()
-            sample_size = min(synthetic_config.canaries_per_batch, len(canaries))
-            if sample_size > 0:
-                fragments.extend(random.sample(canaries, sample_size))
-
-        return fragments
+        """Generate the synthetic fragments riding along with `real_count` chunks."""
+        return plan_synthetic_fragments(
+            self._config, self._get_generator, real_count
+        )
 
     def submit(self) -> str | None:
         """Send every not-yet-submitted chunk, mixed with synthetic fragments.
@@ -258,7 +281,7 @@ class Detector:
                 continue
 
             try:
-                entities = _parse_entities(message)
+                entities = parse_entities(message)
             except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
                 counts["errored"] += 1
                 logger.warning("Chunk %s returned unparsable output: %s", custom_id, exc)
@@ -306,7 +329,7 @@ class Detector:
             return
 
         try:
-            found = _parse_entities(message)
+            found = parse_entities(message)
         except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
             counts["errored"] += 1
             logger.warning("Honeytoken %s returned unparsable output: %s", custom_id, exc)
@@ -316,8 +339,12 @@ class Detector:
         counts["honeytokens_scored"] += 1
 
 
-def _parse_entities(message: Any) -> list[tuple[str, str]]:
+def parse_entities(message: Any) -> list[tuple[str, str]]:
     """Extract (text, type) pairs from a successful detection message.
+
+    Public because the batch path here and any synchronous transport must read
+    a detection answer by the exact same rules; a stricter or laxer second
+    parser would make the two paths disagree about what the provider returned.
 
     Raises ValueError, KeyError or TypeError when the payload does not match
     the requested schema; callers count that as an errored chunk.
@@ -350,3 +377,7 @@ def _parse_entities(message: Any) -> list[tuple[str, str]]:
             raise ValueError(f"unknown entity type {entity_type!r}")
         entities.append((entity_text, entity_type))
     return entities
+
+
+# Kept so that any existing caller of the former private name keeps working.
+_parse_entities = parse_entities

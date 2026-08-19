@@ -101,6 +101,66 @@ class Chunker:
         """
         return self._encoding.encode(text, disallowed_special=())
 
+    def token_strings(self, text: str) -> list[str]:
+        """Decode every token of `text` on its own, for display purposes.
+
+        The list length is the token count, and for text whose characters each
+        live inside a single token the concatenation is `text` again. A
+        character split across two tokens cannot be shown that way, so the
+        pieces are decoded with `errors="replace"`: this output is only ever
+        shown to a reader, never stored and never sent anywhere, so a U+FFFD in
+        it costs nothing. Chunk text itself is produced by `chunk`, which is
+        lossless.
+        """
+        return [
+            self._encoding.decode_single_token_bytes(token).decode(
+                "utf-8", errors="replace"
+            )
+            for token in self._encode(text)
+        ]
+
+    def token_display_segments(self, text: str) -> list[str]:
+        """Split `text` into displayable pieces that follow the token boundaries.
+
+        Like `token_strings`, but lossless: bytes are accumulated token by token
+        and a segment is emitted as soon as what has accumulated is valid UTF-8.
+        A token whose bytes end mid-character therefore merges with the tokens
+        that complete it, so a name such as "Šimeček" is shown as written
+        instead of as the U+FFFD pairs an individually decoded token yields.
+
+        Guarantees, for any `text`:
+
+            "".join(token_display_segments(text)) == text
+
+        and no segment carries a U+FFFD that `text` did not already carry. Most
+        segments are exactly one token; only the ones spanning a split
+        character are longer, which is why this is a display aid and not a
+        token count - use `token_strings` when the number of tokens is what
+        matters.
+        """
+        segments: list[str] = []
+        pending = b""
+        for token in self._encode(text):
+            pending += self._encoding.decode_single_token_bytes(token)
+            try:
+                segments.append(pending.decode("utf-8"))
+            except UnicodeDecodeError:
+                # The character is not complete yet; the next token carries the
+                # rest of its bytes.
+                continue
+            pending = b""
+
+        if pending:
+            # Unreachable for text that round-trips through the encoder: its
+            # last token cannot end mid-character. Kept lossy-but-visible
+            # rather than silently dropping bytes.
+            logger.warning(
+                "Trailing %d undecodable byte(s) while building display segments",
+                len(pending),
+            )
+            segments.append(pending.decode("utf-8", errors="replace"))
+        return segments
+
     def chunk(self, text: str) -> list[str]:
         """Split `text` into consecutive chunks of roughly `chunk_size` tokens.
 

@@ -162,11 +162,15 @@ All tunables live in `config/config.json`:
 | `chunking.chunk_size_tokens` | `22` | Tokens per stored chunk |
 | `chunking.encoding` | `cl100k_base` | tiktoken encoding |
 | `chunking.name_run_max_extension_tokens` | `12` | Max extra tokens a cut may move so it never splits a capitalized name run |
+| `conversion.service_url` | `""` (empty) | Optional external conversion service; empty means the built-in markitdown converter is used |
 | `anthropic.model` | `claude-opus-5` | Detection model |
 | `anthropic.effort` | `low` | Reasoning effort for detection requests |
 | `anthropic.max_tokens` | `1024` | Max output tokens per request |
+| `anthropic.detect_concurrency` | `6` | Detection requests kept in flight by the web app's synchronous path |
 | `redaction.person` | `**PERSON**` | Placeholder for person names |
 | `redaction.company` | `**COMPANY**` | Placeholder for company names |
+| `redaction.email` | `**EMAIL**` | Placeholder for email addresses, replaced whole and without the detector |
+| `redaction.url` | `**URL**` | Placeholder for URLs, replaced whole and without the detector |
 | `synthetic.honeytokens_enabled` | `true` | Mix honeytokens into batches |
 | `synthetic.chaff_enabled` | `true` | Mix chaff into batches |
 | `synthetic.canaries_enabled` | `true` | Seed canaries into batches |
@@ -177,6 +181,8 @@ All tunables live in `config/config.json`:
 | `synthetic.seed` | `20260818` | Seed for the deterministic name factory |
 | `synthetic.llm.base_url` | `http://localhost:11434/v1` | OpenAI-compatible local LLM endpoint |
 | `synthetic.llm.model` | `qwen2.5:7b` | Local model for synthetic prose |
+| `synthetic.llm.catalog` | 3 entries | Local models the Settings view offers, with measured size, seconds per fragment and first-try validity |
+| `synthetic.llm.catalog_note` | see config | Where those figures were measured |
 
 ## Privacy model, honestly
 

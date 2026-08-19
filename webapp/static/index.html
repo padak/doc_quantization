@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>doc_quantization — observability console</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">dq</div>
+        <div class="brand-text">
+          <div class="brand-name">doc_quantization</div>
+          <div class="brand-sub">observability console</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Pipeline navigation">
+        <div class="nav-group-label">Pipeline</div>
+        <div id="nav-steps"></div>
+        <div class="nav-sep"></div>
+        <div class="nav-group-label">Always available</div>
+        <div id="nav-aux"></div>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="active-doc">
+          <div class="active-doc-label">Active document</div>
+          <div class="active-doc-name is-empty" id="active-doc-name">none</div>
+          <div class="active-doc-id" id="active-doc-id"></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <section class="view" data-view="document" hidden></section>
+      <section class="view" data-view="chunks" hidden></section>
+      <section class="view" data-view="batch" hidden></section>
+      <section class="view" data-view="llm" hidden></section>
+      <section class="view" data-view="redaction" hidden></section>
+      <section class="view" data-view="report" hidden></section>
+      <section class="view" data-view="settings" hidden></section>
+    </main>
+  </div>
+
+  <div class="popover" id="popover" role="dialog" aria-labelledby="pop-title" hidden></div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
