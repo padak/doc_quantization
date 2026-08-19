@@ -17,11 +17,13 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
 | --- | --- |
 | `doc_quant/chunker.py` | tiktoken chunking (~22 tokens), lossless, name-aware cuts |
 | `doc_quant/store.py` | SQLite KV: documents, chunks, batches, entities, synthetic registry, probes |
-| `doc_quant/synthetic.py` | honeytokens / chaff / canaries; name factory + local LLM wrapper |
+| `doc_quant/synthetic.py` | honeytokens / chaff / canaries; name factory + prose via `local_llm` |
+| `doc_quant/local_llm.py` | `LocalLLMClient` for OpenAI-compatible servers (Ollama, LM Studio); raw `chat_completion`. Lived in `synthetic.py`, still re-exported there |
 | `doc_quant/detector.py` | Anthropic **Message Batches** path (CLI); shared `plan_synthetic_fragments`, `parse_entities`, `DETECTION_SYSTEM_PROMPT`, `ENTITY_SCHEMA` |
+| `doc_quant/local_detector.py` | local detection parity core: same prompt + schema as remote, OpenAI-style `response_format` json_schema, verbatim guard, `/models` probe before any store write, `local-` batch ids with `sync` / `sync-completed` |
 | `doc_quant/redactor.py` | deterministic replacement: URLs → emails → entity alternation |
-| `doc_quant/cli.py` | ingest / chunk get+set / reconstruct / submit / status / fetch / redact / synthetic-report / canary-probe |
-| `webapp/server.py` + `webapp/static/` | FastAPI observability console (port 8801); **synchronous** per-fragment detection with payloads identical to the batch path |
+| `doc_quant/cli.py` | ingest / chunk get+set / reconstruct / submit / status / fetch / detect / redact / synthetic-report / canary-probe |
+| `webapp/server.py` + `webapp/static/` | FastAPI observability console (port 8801); **synchronous** per-fragment detection branching on `detection.provider`, payloads identical to the CLI path of the same provider |
 | `webapp/settings.py` | overrides on top of config, persisted in gitignored `data/settings.json` |
 
 ## Invariants — do not break these
@@ -45,10 +47,14 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
    hallucination must never mint a tracked name (it could be a real person).
    Synthetic results must never reach the entities table or redacted output —
    tests enforce this; keep them.
-5. **Payload parity between transports.** The webapp's sync detection and the
-   CLI batch path must send byte-identical request payloads (same system
-   prompt, schema, effort, mixing math). Shared helpers exist for this — do
-   not fork the logic.
+5. **Payload parity between transports, per provider.** Whatever the backend,
+   the webapp and the CLI must send byte-identical request payloads. For
+   `anthropic`: the webapp's sync detection and the CLI batch path share
+   `detector`'s helpers (same system prompt, schema, effort, mixing math).
+   For `local`: the webapp's local branch and the CLI `detect` build every
+   request and read every answer exclusively through `local_detector` (same
+   `DETECTION_SYSTEM_PROMPT` and `ENTITY_SCHEMA` as remote — only the
+   transport differs, never the question). Do not fork either.
 6. **Deterministic redaction order.** URLs first, then emails, then a single
    longest-first entity alternation with word-boundary lookarounds; `person`
    beats `company` for the same string; entity texts equal to a placeholder's
@@ -73,6 +79,19 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
    arms-length HTTP boundary precisely so this repo stays clean Apache-2.0.
    The service contract (`POST /convert`, `GET /health`) is deliberately
    generic and replaceable.
+10. **Local mode is all-local, and deliberately bare.** With
+   `detection.provider = "local"` nothing leaves the machine, so the
+   decontextualization apparatus has nothing to do: mixing, honeytokens,
+   chaff, canaries and the shuffle are switched off for that run and
+   `honeytoken_recall` is reported as `null`, never as a zero. Do not "restore
+   parity" by re-enabling them. Chunks stay the detection unit anyway — small
+   local models recall names better on short fragments. Local answers pass a
+   verbatim guard (an entity that is not a substring of its own fragment is
+   dropped and counted) because only Anthropic's structured outputs enforce
+   the exact-substring contract hard. The CLI dispatcher refuses the other
+   backend's commands: `submit`/`fetch`/`status <id>` under `local`, `detect`
+   under `anthropic`; bare `status` only lists stored batches and stays
+   offline-usable under both.
 
 ## Anthropic API specifics
 
@@ -87,7 +106,7 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
 
 ## Dev workflow
 
-- venv at `.venv`; `.venv/bin/pytest -q` (368 tests, all offline — fakes for
+- venv at `.venv`; `.venv/bin/pytest -q` (503 tests, all offline — fakes for
   Anthropic, local LLM, conversion service); `node --check webapp/static/app.js`.
 - `requirements.txt` holds **direct deps with lower bounds only** — never
   `pip freeze` (breaks Python 3.9 colleagues); verified 3.9–3.14.
@@ -97,6 +116,10 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
   `llama3.2:1b` measured ~2× faster at 94% validity; template mode
   (`llm_enabled=false`) is instant and needs no server. Catalog with measured
   stats lives in config (`synthetic.llm.catalog`) — data, not code.
+  `detection.local` is a *separate* endpoint/model from `synthetic.llm` on
+  purpose: switching the detection backend must not silently change which
+  model writes chaff. Its model field is offered from the server's own
+  `/models` list (`GET /api/detection/local-models`), not from a catalog.
 - Git: PR flow for everything (branch → PR → merge), branches deleted after
   merge. The maintainer merges fast — push *all* companion commits (README,
   docs) before announcing a PR as ready, or they get orphaned on a merged
@@ -119,7 +142,9 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
 - **Local-first funnel**: gazetteer + local NER ensemble (GLiNER-PII, spaCy
   trf, open-weights LLM) over whole documents; pre-redact known names; send
   only candidate-centered residual spans to the API. Kills the "known names
-  travel" gap.
+  travel" gap. Distinct from the shipped `detection.provider = local`, which
+  is the all-or-nothing end of the same axis (everything local, nothing sent);
+  the funnel is the hybrid in between.
 - Bare identifiers in prose (case numbers like "3979-4561-9198") are not
   redacted — neither URL, email, nor name.
 - Batch-API mode in the webapp UI (submit/poll/fetch with the same
