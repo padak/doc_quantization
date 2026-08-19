@@ -36,12 +36,20 @@ API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 # break an older one.
 BOOL_SETTINGS_KEYS: tuple[str, ...] = ("llm_enabled",)
 
+# String keys whose empty value is a decision rather than an absence, so they
+# are stored by presence: an empty conversion service URL says "convert with the
+# built-in markitdown", which is a different statement from "no override, take
+# whatever config/config.json says". Every other string key falls back to the
+# config once it is cleared, which is why an empty one is dropped there.
+PRESENCE_SETTINGS_KEYS: tuple[str, ...] = ("conversion_service_url",)
+
 SETTINGS_KEYS: tuple[str, ...] = (
     API_KEY_SETTING,
     "model",
     "effort",
     "llm_base_url",
     "llm_model",
+    *PRESENCE_SETTINGS_KEYS,
     *BOOL_SETTINGS_KEYS,
 )
 
@@ -69,7 +77,8 @@ def load_overrides(path: Path) -> dict[str, SettingValue]:
     are dropped here as well as on write, so "cleared" and "never set" behave
     identically no matter how the file came to be. A switch (see
     `BOOL_SETTINGS_KEYS`) is kept whichever way it points: False is a decision,
-    not an absent value.
+    not an absent value. So is an empty value of a presence key (see
+    `PRESENCE_SETTINGS_KEYS`), which is kept for the same reason.
 
     Raises:
         ConfigError: when the file exists but is not a JSON object whose values
@@ -105,7 +114,7 @@ def load_overrides(path: Path) -> dict[str, SettingValue]:
             raise ConfigError(
                 f"Settings key {key} must be a string, got {type(value).__name__}"
             )
-        if value:
+        if value or key in PRESENCE_SETTINGS_KEYS:
             overrides[key] = value
 
     unknown = sorted(set(raw) - set(SETTINGS_KEYS))
@@ -122,7 +131,8 @@ def save_overrides(
     A key mapped to None or to the empty string is removed, which is how the
     user clears an override (including the API key) and falls back to the
     config default or the environment. A switch set to False is stored rather
-    than removed: switching something off is an override like any other.
+    than removed: switching something off is an override like any other, and so
+    is the empty value of a presence key (see `PRESENCE_SETTINGS_KEYS`).
 
     Returns:
         The merged overrides as they were persisted.
@@ -137,7 +147,7 @@ def save_overrides(
 
     merged = load_overrides(path)
     for key, value in updates.items():
-        if value is None or value == "":
+        if value is None or (value == "" and key not in PRESENCE_SETTINGS_KEYS):
             merged.pop(key, None)
         else:
             merged[key] = value
@@ -173,9 +183,14 @@ def effective_config(config: AppConfig, overrides: dict[str, SettingValue]) -> A
         base_url=_text(overrides, "llm_base_url") or config.synthetic.llm.base_url,
         model=_text(overrides, "llm_model") or config.synthetic.llm.model,
     )
+    conversion_config = replace(
+        config.conversion,
+        service_url=effective_conversion_service_url(config, overrides),
+    )
     return replace(
         config,
         anthropic=anthropic_config,
+        conversion=conversion_config,
         synthetic=replace(config.synthetic, llm=llm_config),
     )
 
@@ -191,6 +206,21 @@ def effective_llm_enabled(config: AppConfig, overrides: dict[str, SettingValue])
     if isinstance(stored, bool):
         return stored
     return config.synthetic.llm.enabled
+
+
+def effective_conversion_service_url(
+    config: AppConfig, overrides: dict[str, SettingValue]
+) -> str:
+    """Where documents are converted: an external service, or nothing.
+
+    An empty result means the built-in markitdown converter. The stored setting
+    wins whenever it is present, empty included - a user who cleared the field
+    asked for the built-in converter, which the config's own URL must not undo.
+    """
+    stored = overrides.get("conversion_service_url")
+    if isinstance(stored, str):
+        return stored
+    return config.conversion.service_url
 
 
 def effective_api_key(overrides: dict[str, SettingValue]) -> str | None:

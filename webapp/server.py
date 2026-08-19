@@ -317,6 +317,9 @@ class SettingsUpdate(BaseModel):
     llm_base_url: str | None = None
     llm_model: str | None = None
     llm_enabled: bool | None = None
+    # Stored verbatim, empty string included: an empty URL is the user asking
+    # for the built-in converter rather than clearing an override.
+    conversion_service_url: str | None = None
 
 
 class DetectRequest(BaseModel):
@@ -415,6 +418,7 @@ def _settings_payload(context: RequestContext) -> dict:
         "llm_base_url": config.synthetic.llm.base_url,
         "llm_model": config.synthetic.llm.model,
         "llm_enabled": config.synthetic.llm.enabled,
+        "conversion_service_url": config.conversion.service_url,
         "chunk_size_tokens": config.chunking.chunk_size_tokens,
         "chaff_ratio": config.synthetic.chaff_ratio,
         "honeytoken_rate": config.synthetic.honeytoken_rate,
@@ -1312,8 +1316,9 @@ def _check_conversion_service(config: AppConfig) -> dict:
 
     url = f"{service_url.rstrip('/')}{HEALTH_PATH}"
     hint = (
-        "start the conversion service, or clear conversion.service_url to use "
-        "the built-in markitdown converter"
+        "start the conversion service, or clear conversion.service_url "
+        "(Settings > Conversion service URL) to use the built-in markitdown "
+        "converter"
     )
     try:
         client = get_http_client()

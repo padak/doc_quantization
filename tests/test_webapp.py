@@ -334,6 +334,11 @@ def harness(tmp_path, monkeypatch) -> Harness:
     db_path = tmp_path / "chunks.db"
     config = load_config()
     config = replace(config, database=replace(config.database, path=db_path))
+    # The external conversion service is opt-in per test: a service_url left in
+    # the developer's own config/config.json must not decide how an upload is
+    # converted here, any more than their database path decides where it is
+    # stored.
+    config = replace(config, conversion=replace(config.conversion, service_url=""))
     monkeypatch.setattr(server, "get_config", lambda: config)
 
     settings_path = tmp_path / "settings.json"
@@ -466,6 +471,8 @@ def test_get_settings_masks_the_key_and_reports_config_defaults(harness):
     assert payload["llm_base_url"] == config.synthetic.llm.base_url
     assert payload["llm_model"] == config.synthetic.llm.model
     assert payload["llm_enabled"] == config.synthetic.llm.enabled
+    # The fixture pins the conversion service off, so this is the config value.
+    assert payload["conversion_service_url"] == ""
     assert payload["chunk_size_tokens"] == config.chunking.chunk_size_tokens
     assert payload["chaff_ratio"] == config.synthetic.chaff_ratio
     assert payload["honeytoken_rate"] == config.synthetic.honeytoken_rate
@@ -515,6 +522,72 @@ def test_llm_enabled_survives_being_switched_off_and_on(harness):
 
     assert payload["llm_enabled"] is True
     assert harness.client.get("/api/settings").json()["llm_enabled"] is True
+
+
+def test_conversion_service_url_roundtrips_and_keeps_an_explicit_empty(harness, monkeypatch):
+    """An empty URL is a stored decision, not an absent setting.
+
+    The config points at a service here, so falling back to it would be visible:
+    only a stored empty value can keep the answer empty.
+    """
+    set_conversion_service(monkeypatch, "http://from-config:9000")
+    assert harness.client.get("/api/settings").json()["conversion_service_url"] == (
+        "http://from-config:9000"
+    )
+
+    payload = harness.client.put(
+        "/api/settings", json={"conversion_service_url": "http://converter:9000"}
+    ).json()
+
+    assert payload["conversion_service_url"] == "http://converter:9000"
+    assert harness.client.get("/api/settings").json() == payload
+    stored = json.loads(harness.settings_path.read_text(encoding="utf-8"))
+    assert stored["conversion_service_url"] == "http://converter:9000"
+    # The untouched key is still there: one field may be sent on its own.
+    assert stored["anthropic_api_key"] == DUMMY_API_KEY
+
+    payload = harness.client.put(
+        "/api/settings", json={"conversion_service_url": ""}
+    ).json()
+
+    assert payload["conversion_service_url"] == ""
+    assert harness.client.get("/api/settings").json()["conversion_service_url"] == ""
+    stored = json.loads(harness.settings_path.read_text(encoding="utf-8"))
+    assert stored["conversion_service_url"] == ""
+
+
+def test_conversion_service_url_setting_routes_the_upload(harness):
+    """The stored URL is where the file actually goes."""
+    harness.client.put(
+        "/api/settings", json={"conversion_service_url": "http://converter:9000"}
+    )
+    harness.http.serve_conversion("# Converted\n\nJan Novak signed it.\n")
+
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.pdf", b"%PDF-1.7 fake bytes", "application/pdf")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["markdown"] == "# Converted\n\nJan Novak signed it.\n"
+    assert [call["url"] for call in harness.http.posted] == [
+        "http://converter:9000/convert"
+    ]
+
+
+def test_empty_conversion_service_url_setting_converts_locally(harness, monkeypatch):
+    """A cleared field wins over a service_url left in the config."""
+    set_conversion_service(monkeypatch, "http://from-config:9000")
+    harness.client.put("/api/settings", json={"conversion_service_url": ""})
+
+    response = harness.client.post(
+        "/api/documents",
+        files={"file": ("report.html", SAMPLE_HTML.encode("utf-8"), "text/html")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "# Acme Report" in response.json()["markdown"]
+    assert harness.http.posted == []
 
 
 def test_settings_never_echo_the_raw_key(harness):
@@ -1448,6 +1521,34 @@ def test_verify_probes_a_configured_conversion_service(harness, monkeypatch):
     assert checks["conversion"]["ok"] is True
     assert "engine=pymupdf" in checks["conversion"]["detail"]
     assert "http://converter:9000/health" in harness.http.requested
+
+
+def test_verify_probes_the_conversion_service_from_the_settings(harness):
+    """The preflight checks the service the user configured, not the config's."""
+    harness.client.put(
+        "/api/settings", json={"conversion_service_url": "http://converter:9000"}
+    )
+    harness.http.response = SimpleNamespace(
+        status_code=200, json=lambda: {"status": "ok", "engine": "pymupdf"}
+    )
+
+    checks = verify(harness)
+
+    assert checks["conversion"]["ok"] is True
+    assert "engine=pymupdf" in checks["conversion"]["detail"]
+    assert "http://converter:9000/health" in harness.http.requested
+
+
+def test_verify_follows_a_conversion_service_cleared_in_the_settings(harness, monkeypatch):
+    """With the field emptied, nothing is probed even though the config has a URL."""
+    set_conversion_service(monkeypatch, "http://from-config:9000")
+    harness.client.put("/api/settings", json={"conversion_service_url": ""})
+
+    checks = verify(harness)
+
+    assert checks["conversion"]["ok"] is True
+    assert "markitdown" in checks["conversion"]["detail"]
+    assert all("/health" not in url for url in harness.http.requested)
 
 
 def test_verify_reports_an_unreachable_conversion_service(harness, monkeypatch):
