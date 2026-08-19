@@ -149,7 +149,9 @@ In the web console the same run streams into the usual live progress view,
 one line per call; the Settings page carries a Detection section where the
 provider, the endpoint and the model are set. The model field offers what the
 configured server actually serves — model ids have to match the server's own
-spelling, tag included, and that is precisely what nobody can guess.
+spelling, tag included, and that is precisely what nobody can guess:
+
+![Detection settings](docs/screenshots/09-settings.png)
 
 **What local mode deliberately drops.** Honeytokens, chaff, canaries and the
 shuffle all exist to make a *remote* provider's retained copy of the traffic
