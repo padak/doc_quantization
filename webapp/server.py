@@ -21,6 +21,13 @@ mixing (honeytokens, chaff, canaries) and the shuffle come from
 `doc_quant.detector.plan_synthetic_fragments`, so the composition is the same
 too; only the transport differs.
 
+With `detection.provider` set to "local" the same endpoint runs a second,
+deliberately plainer path: fragments go to a local OpenAI-compatible server
+through `doc_quant.local_detector`, with no synthetics, no shuffle and no API
+key - nothing leaves the machine, so there is no provider to dilute or to hide
+the document's shape from. It emits the same events with the same names, so
+the frontend renders either run with one code path.
+
 `requests[].kind` and `requests[].seq` in the detect response are the LOCAL
 view. The provider never receives them: it sees ids and texts in the shuffled
 submission order and nothing else, which is exactly what the frontend renders
@@ -51,6 +58,7 @@ from pydantic import BaseModel
 from doc_quant.chunker import Chunker
 from doc_quant.cli import run_canary_probe
 from doc_quant.config import (
+    DETECTION_PROVIDER_LOCAL,
     PROJECT_ROOT,
     AppConfig,
     ConfigError,
@@ -63,6 +71,17 @@ from doc_quant.detector import (
     parse_entities,
     plan_synthetic_fragments,
 )
+from doc_quant.local_detector import (
+    LOCAL_BATCH_STATUS_COMPLETED,
+    LOCAL_BATCH_STATUS_RUNNING,
+    build_local_payload_template,
+    detect_local,
+    get_local_client,
+    new_local_batch_id,
+    probe_local_server,
+)
+from doc_quant.local_detector import STATUS_OK as LOCAL_STATUS_OK
+from doc_quant.local_llm import LocalLLMError
 from doc_quant.redactor import EMAIL, URL, find_emails, find_urls, redact_text
 from doc_quant.store import ChunkStore
 from doc_quant.synthetic import (
@@ -137,6 +156,12 @@ STATUS_OK = "ok"
 STATUS_REFUSAL = "refusal"
 STATUS_ERROR = "error"
 
+# The two detection backends report their per-fragment outcome with the same
+# vocabulary, which is what lets one result event - and one frontend code path
+# - serve both. Pinned here rather than assumed, so a rename on either side is
+# a loud import-time failure instead of a run that silently stores nothing.
+assert LOCAL_STATUS_OK == STATUS_OK, "local and remote detection must agree on 'ok'"
+
 REFUSAL_STOP_REASON = "refusal"
 
 NO_UNSUBMITTED_CHUNKS_MESSAGE = "no unsubmitted chunks"
@@ -188,6 +213,7 @@ HTTP_NOT_FOUND = 404
 HTTP_CONFLICT = 409
 HTTP_UNPROCESSABLE = 422
 HTTP_BAD_GATEWAY = 502
+HTTP_SERVICE_UNAVAILABLE = 503
 
 
 def configure_logging() -> None:
@@ -254,6 +280,17 @@ def get_anthropic_client(api_key: str | None) -> Any:
     if not api_key:
         raise ConfigError(MISSING_API_KEY_MESSAGE)
     return anthropic.Anthropic(api_key=api_key)
+
+
+def get_local_detection_client(config: AppConfig) -> Any:
+    """Build the client for the local detection endpoint.
+
+    A factory of its own, mirroring `get_anthropic_client`, so a test can
+    replace the whole local backend by monkeypatching this one attribute. It
+    takes no API key: the point of local mode is that there is nobody to
+    authenticate to.
+    """
+    return get_local_client(config)
 
 
 def get_generator(config: AppConfig, store: ChunkStore) -> Any:
@@ -333,6 +370,13 @@ class SettingsUpdate(BaseModel):
     llm_base_url: str | None = None
     llm_model: str | None = None
     llm_enabled: bool | None = None
+    # Which backend detection requests go to, and where the local one lives.
+    # `detection_provider` is an enum checked in webapp.settings against
+    # VALID_DETECTION_PROVIDERS, so an unknown backend name is a 400 here
+    # rather than a surprise at detection time.
+    detection_provider: str | None = None
+    detection_local_base_url: str | None = None
+    detection_local_model: str | None = None
     # Stored verbatim, empty string included: an empty URL is the user asking
     # for the built-in converter rather than clearing an override.
     conversion_service_url: str | None = None
@@ -385,6 +429,20 @@ async def config_error_handler(request: Request, exc: ConfigError) -> JSONRespon
     """Report a configuration problem as a 400 carrying its own message."""
     logger.warning("Configuration error on %s: %s", request.url.path, exc)
     return JSONResponse(status_code=HTTP_BAD_REQUEST, content={"detail": str(exc)})
+
+
+@app.exception_handler(LocalLLMError)
+async def local_llm_error_handler(request: Request, exc: LocalLLMError) -> JSONResponse:
+    """Report an unreachable local model server as a 503 carrying its message.
+
+    503 rather than 400: nothing about the request is wrong, a dependency the
+    server needs is simply not answering. The message already says how to
+    start one, so it is passed through verbatim.
+    """
+    logger.warning("Local LLM error on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=HTTP_SERVICE_UNAVAILABLE, content={"detail": str(exc)}
+    )
 
 
 @app.middleware("http")
@@ -469,6 +527,12 @@ def _settings_payload(context: RequestContext) -> dict:
         "llm_model": config.synthetic.llm.model,
         "llm_enabled": config.synthetic.llm.enabled,
         "conversion_service_url": config.conversion.service_url,
+        # Which detection backend is in use, and where the local one lives.
+        # Not part of `pipeline_defaults` below: those are the mixing and
+        # chunking parameters, and a backend choice is neither.
+        "detection_provider": config.detection.provider,
+        "detection_local_base_url": config.detection.local.base_url,
+        "detection_local_model": config.detection.local.model,
         "chunk_size_tokens": config.chunking.chunk_size_tokens,
         "chaff_ratio": config.synthetic.chaff_ratio,
         "honeytoken_rate": config.synthetic.honeytoken_rate,
@@ -930,9 +994,15 @@ def detect(
     whole submission in provider order, one `result` event per provider call as
     it completes, and a final `done` event carrying the complete run.
 
+    With `detection.provider` set to "local" the run takes the branch below
+    instead: no synthetics, no shuffle, no API key, and the fragments go to a
+    local OpenAI-compatible server. The event vocabulary is the same either
+    way, so the frontend renders both runs with one code path.
+
     Everything that can fail before the first byte is checked here rather than
-    in the stream, so an unknown document, an already-detected one and a
-    missing API key stay ordinary HTTP errors with a status code.
+    in the stream, so an unknown document, an already-detected one, a missing
+    API key and a dead local server stay ordinary HTTP errors with a status
+    code.
     """
     _require_document(store, request.doc_id)
     chunks = [
@@ -943,6 +1013,17 @@ def detect(
     if not chunks:
         raise HTTPException(
             status_code=HTTP_CONFLICT, detail=NO_UNSUBMITTED_CHUNKS_MESSAGE
+        )
+
+    if context.config.detection.provider == DETECTION_PROVIDER_LOCAL:
+        # Before anything is marked as submitted: a dead local server must
+        # leave the document exactly as it was, which is the same rule the
+        # remote path applies to a missing API key.
+        probe_local_server(context.config)
+        local_client = get_local_detection_client(context.config)
+        return StreamingResponse(
+            _local_detect_events(context.config, store, local_client, chunks),
+            media_type=NDJSON_MEDIA_TYPE,
         )
 
     # Before anything is generated or marked as submitted: a missing key must
@@ -1166,6 +1247,136 @@ def _run_detection_stream(
             "requests": planned,
             "results": results,
             "honeytoken_recall": _honeytoken_recall(planted_by_id, honeytokens_found),
+            "entities_stored": entities_stored,
+        }
+    )
+
+
+def _local_detect_events(
+    config: AppConfig,
+    store: ChunkStore,
+    client: Any,
+    chunks: list[dict],
+) -> Iterator[str]:
+    """Wrap the local run so a mid-stream failure still reaches the reader.
+
+    Same contract as `_detect_events`: the status line is long gone by then,
+    so the only way to report a break is a last event saying so.
+    """
+    try:
+        yield from _run_local_detection_stream(config, store, client, chunks)
+    except Exception as exc:  # noqa: BLE001 - the stream must not die silently
+        logger.exception("Local detection stream failed")
+        yield _ndjson({"type": EVENT_ERROR, "detail": _readable(exc)})
+
+
+def _run_local_detection_stream(
+    config: AppConfig,
+    store: ChunkStore,
+    client: Any,
+    chunks: list[dict],
+) -> Iterator[str]:
+    """Submit chunks to the local model, emitting one event per finished step.
+
+    No synthetics, no shuffle: nothing leaves the machine, so there is no
+    provider to hide the document's shape from, and seq order is the more
+    watchable one. Honeytokens measure a remote provider's recall and chaff
+    dilutes what it holds - neither has anything to measure or dilute here -
+    so `honeytoken_recall` is reported as null rather than as a zero.
+
+    The event vocabulary is the remote sync path's, so the frontend renders
+    both runs with one code path, and every request is built by
+    `local_detector.build_local_request` from the very template this stream
+    reports as `payload_template` - the same one the CLI's local path uses -
+    so what is observed here is what is sent, on either transport.
+    """
+    yield _ndjson(
+        _phase_event(PHASE_PLANNING, f"{len(chunks)} real fragments, local model")
+    )
+
+    planned = [
+        {
+            "custom_id": chunk["chunk_id"],
+            "kind": KIND_REAL,
+            "seq": chunk["seq"],
+            "text": chunk["text"],
+        }
+        for chunk in chunks
+    ]
+
+    batch_id = new_local_batch_id()
+    store.record_batch(batch_id, LOCAL_BATCH_STATUS_RUNNING)
+    store.mark_chunks_submitted([chunk["chunk_id"] for chunk in chunks], batch_id)
+
+    template = build_local_payload_template(config)
+    composition = {KIND_REAL: len(chunks)}
+
+    # Emitted after the marking, before the first model call: this is exactly
+    # what is about to be asked, in order.
+    yield _ndjson(
+        {
+            "type": EVENT_SUBMITTED,
+            "batch_id": batch_id,
+            "composition": composition,
+            "payload_template": template,
+            "requests": planned,
+        }
+    )
+
+    results: list[dict] = []
+    entities_stored = 0
+    # As on the remote path, a worker does one thing: send a fragment and time
+    # the answer. It touches no store, so every SQLite write stays on this
+    # thread - the store's connection belongs to the thread that opened it.
+    workers = max(1, config.detection.local.concurrency)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(detect_local, client, template, item["text"]): item
+            for item in planned
+        }
+        # Completion order, not submission order: a result is reported the
+        # moment it lands, which is the whole point of running several at once.
+        for index, future in enumerate(as_completed(futures), start=1):
+            item = futures[future]
+            outcome = future.result()
+            result = {
+                "custom_id": item["custom_id"],
+                "kind": item["kind"],
+                "status": outcome.status,
+                "entities": _entity_payloads(outcome.entities),
+                "raw_text": outcome.raw_text,
+                "latency_ms": outcome.latency_ms,
+                "detail": outcome.detail,
+                # Local-only: how many names the model invented and the
+                # verbatim guard threw away. Visible because it is the honest
+                # measure of how much a small model is making up.
+                "dropped": outcome.dropped,
+            }
+            results.append(result)
+            yield _ndjson(
+                {"type": EVENT_RESULT, "index": index, "total": len(planned), **result}
+            )
+            if outcome.status == STATUS_OK:
+                store.add_entities(item["custom_id"], outcome.entities)
+                entities_stored += len(outcome.entities)
+    finally:
+        # A reader that walks away must not keep the run going: whatever is
+        # still queued is dropped rather than waited for.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    store.set_batch_status(batch_id, LOCAL_BATCH_STATUS_COMPLETED)
+    logger.info("Local batch %s finished: %d chunks", batch_id, len(chunks))
+
+    yield _ndjson(
+        {
+            "type": EVENT_DONE,
+            "batch_id": batch_id,
+            "composition": composition,
+            "payload_template": template,
+            "requests": planned,
+            "results": results,
+            "honeytoken_recall": None,
             "entities_stored": entities_stored,
         }
     )
