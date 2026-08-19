@@ -118,8 +118,7 @@
   const REMEDY = {
     anthropic: 'Paste a valid key into the Anthropic API key field above and save.',
     local_llm: 'Start the local model server (for example: ollama serve) and pull the configured model, or pick "Deterministic templates" as the synthetic prose generator.',
-    markitdown: 'Install the markitdown package into the server environment.',
-    conversion: 'Start the external conversion service, or empty the "Conversion service URL" field below and save to use the built-in converter.',
+    conversion: 'Start the conversion service (github.com/padak/doc_converter), or empty the "Conversion service URL" field below and save to run in text-only mode.',
     database: 'Check that the data directory exists and is writable by the server process.',
   };
 
@@ -679,7 +678,7 @@
       html += '<div class="dropzone-busy"><span class="spinner"></span><span>Converting and chunking</span></div>';
     } else {
       html += '<div class="dropzone-title">Drop a document here, or click to choose a file</div>';
-      html += '<div class="dropzone-hint">PDF, DOCX, PPTX, HTML, TXT and Markdown. The file is converted to Markdown on this machine.</div>';
+      html += '<div class="dropzone-hint">Markdown and plain text are ingested directly; PDF, DOCX, PPTX and HTML need the conversion service configured in Settings.</div>';
     }
     html += '</div>';
     html += '<input type="file" id="file-input" style="display:none">';
@@ -2265,9 +2264,9 @@
 
     html += '<div class="field" style="grid-column:1/-1"><label for="f-conversion">Conversion service URL</label>';
     html += '<input type="text" id="f-conversion" name="conversion_service_url" value="' +
-      esc(settings.conversion_service_url || '') + '" placeholder="empty = built-in markitdown">';
+      esc(settings.conversion_service_url || '') + '" placeholder="empty = Markdown and plain text only">';
     html += '<div class="hint">URL of a doc_converter instance (see github.com/padak/doc_converter) - better PDF ' +
-      'extraction via PyMuPDF. Leave empty to convert with the built-in markitdown.</div></div>';
+      'extraction via PyMuPDF. Leave empty to accept only Markdown and plain text uploads.</div></div>';
 
     html += '</div>';
 

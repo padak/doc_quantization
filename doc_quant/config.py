@@ -58,9 +58,9 @@ class ConversionConfig:
 
     `service_url` points at an optional external conversion service, kept in
     its own repository because the libraries that convert a PDF well are
-    AGPL-licensed and this project is Apache-2.0. An empty string means the
-    feature is off and the built-in markitdown converter is used, which is the
-    default: nothing has to be running for the app to work.
+    AGPL-licensed and this project is Apache-2.0. This project deliberately
+    ships no converter of its own; an empty string means text-only mode, where
+    only Markdown and plain text uploads are accepted.
     """
 
     service_url: str
