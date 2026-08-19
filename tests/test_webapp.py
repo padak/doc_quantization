@@ -613,6 +613,153 @@ def test_empty_api_key_clears_the_stored_one(harness):
 
 
 # ---------------------------------------------------------------------------
+# settings: pipeline parameters
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_defaults_report_the_base_config_regardless_of_overrides(harness):
+    config = load_config()
+
+    before = harness.client.get("/api/settings").json()["pipeline_defaults"]
+    assert before == {
+        "chunk_size_tokens": config.chunking.chunk_size_tokens,
+        "chaff_ratio": config.synthetic.chaff_ratio,
+        "honeytoken_rate": config.synthetic.honeytoken_rate,
+        "canaries_per_batch": config.synthetic.canaries_per_batch,
+        "honeytokens_enabled": config.synthetic.honeytokens_enabled,
+        "chaff_enabled": config.synthetic.chaff_enabled,
+        "canaries_enabled": config.synthetic.canaries_enabled,
+    }
+
+    harness.client.put(
+        "/api/settings",
+        json={
+            "chunk_size_tokens": 4,
+            "chaff_ratio": 0.0,
+            "honeytoken_rate": 0.0,
+            "canaries_per_batch": 0,
+            "honeytokens_enabled": False,
+            "chaff_enabled": False,
+            "canaries_enabled": False,
+        },
+    )
+
+    after = harness.client.get("/api/settings").json()["pipeline_defaults"]
+    assert after == before
+
+
+def test_pipeline_parameters_roundtrip_including_zero_and_false(harness):
+    """0 and False must persist and be reported as the effective value.
+
+    `or`-chaining anywhere on the read path would silently discard these in
+    favour of the config default, which is exactly what must not happen.
+    """
+    response = harness.client.put(
+        "/api/settings",
+        json={
+            "chunk_size_tokens": 6,
+            "chaff_ratio": 0.5,
+            "honeytoken_rate": 0.0,
+            "canaries_per_batch": 0,
+            "honeytokens_enabled": True,
+            "chaff_enabled": False,
+            "canaries_enabled": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["chunk_size_tokens"] == 6
+    assert payload["chaff_ratio"] == 0.5
+    assert payload["honeytoken_rate"] == 0.0
+    assert payload["canaries_per_batch"] == 0
+    assert payload["honeytokens_enabled"] is True
+    assert payload["chaff_enabled"] is False
+    assert payload["canaries_enabled"] is False
+
+    # Survives a fresh read.
+    assert harness.client.get("/api/settings").json() == payload
+
+    stored = json.loads(harness.settings_path.read_text(encoding="utf-8"))
+    assert stored["canaries_per_batch"] == 0
+    assert stored["chaff_enabled"] is False
+    assert stored["canaries_enabled"] is False
+
+
+def test_clearing_a_numeric_setting_falls_back_to_the_config_default(harness):
+    config = load_config()
+    harness.client.put("/api/settings", json={"chunk_size_tokens": 6})
+    assert harness.client.get("/api/settings").json()["chunk_size_tokens"] == 6
+
+    payload = harness.client.put(
+        "/api/settings", json={"chunk_size_tokens": None}
+    ).json()
+
+    assert payload["chunk_size_tokens"] == config.chunking.chunk_size_tokens
+    assert "chunk_size_tokens" not in json.loads(
+        harness.settings_path.read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"chunk_size_tokens": 0},
+        {"chunk_size_tokens": -1},
+        {"chaff_ratio": -0.1},
+        {"honeytoken_rate": -1.0},
+        {"canaries_per_batch": -1},
+    ],
+)
+def test_invalid_pipeline_values_are_rejected_and_leave_the_file_untouched(harness, update):
+    # A prior, valid override must survive an update that fails validation.
+    harness.client.put("/api/settings", json={"chunk_size_tokens": 6})
+    before = harness.settings_path.read_text(encoding="utf-8")
+
+    response = harness.client.put("/api/settings", json=update)
+
+    assert response.status_code == 400
+    assert harness.settings_path.read_text(encoding="utf-8") == before
+    assert harness.client.get("/api/settings").json()["chunk_size_tokens"] == 6
+
+
+def test_settings_file_with_a_malformed_pipeline_value_is_a_400_on_read(harness):
+    stored = json.loads(harness.settings_path.read_text(encoding="utf-8"))
+    stored["chunk_size_tokens"] = "eight"  # wrong type, written outside the app
+    harness.settings_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    response = harness.client.get("/api/settings")
+
+    assert response.status_code == 400
+    assert "chunk_size_tokens" in response.json()["detail"]
+
+
+def test_chunk_size_override_reaches_the_chunker(harness):
+    default_document = upload_markdown(harness, name="default.md")
+    default_count = len(default_document["chunks"])
+
+    harness.client.put("/api/settings", json={"chunk_size_tokens": 3})
+    small_document = upload_markdown(harness, name="small.md")
+
+    assert len(small_document["chunks"]) > default_count
+
+
+def test_chaff_and_canary_overrides_reach_the_detection_plan(harness):
+    document = upload_markdown(harness)
+    real_count = len(document["chunks"])
+    arm_provider(harness, document)
+
+    harness.client.put(
+        "/api/settings", json={"chaff_ratio": 3.0, "canaries_per_batch": 1}
+    )
+
+    result = detect(harness, document["doc_id"])
+
+    assert result["composition"]["chaff"] == round(real_count * 3.0)
+    assert result["composition"]["canary"] == min(1, CANARY_COUNT)
+
+
+# ---------------------------------------------------------------------------
 # upload
 # ---------------------------------------------------------------------------
 

@@ -309,7 +309,19 @@ def store_dependency(
 
 
 class SettingsUpdate(BaseModel):
-    """Partial settings update; only the fields actually sent are applied."""
+    """Partial settings update; only the fields actually sent are applied.
+
+    `model_dump(exclude_unset=True)` in `write_settings` below is what makes
+    "partial" true: a field left out of the request body is not part of the
+    dict handed to `save_overrides` at all, so it leaves the stored override
+    untouched. A field sent as JSON `null`, by contrast, *is* in that dict
+    with value `None`, which `save_overrides` reads as "clear this override
+    and fall back to the config default." Pydantic only checks the shape of
+    each field here (`int`, `float`, `bool`); the range checks (chunk size
+    >= 1, ratios >= 0, ...) live once in `webapp.settings.NUMERIC_SETTINGS_SPECS`
+    so the same rule applies whether a value arrives via this endpoint or is
+    read back from a hand-edited settings file.
+    """
 
     anthropic_api_key: str | None = None
     model: str | None = None
@@ -320,6 +332,16 @@ class SettingsUpdate(BaseModel):
     # Stored verbatim, empty string included: an empty URL is the user asking
     # for the built-in converter rather than clearing an override.
     conversion_service_url: str | None = None
+    # Pipeline parameters: how chunks are sized and how much synthetic
+    # material (honeytokens, chaff, canaries) rides along with them. Bounds
+    # are enforced in webapp.settings, not here - see the class docstring.
+    chunk_size_tokens: int | None = None
+    chaff_ratio: float | None = None
+    honeytoken_rate: float | None = None
+    canaries_per_batch: int | None = None
+    honeytokens_enabled: bool | None = None
+    chaff_enabled: bool | None = None
+    canaries_enabled: bool | None = None
 
 
 class DetectRequest(BaseModel):
@@ -408,8 +430,15 @@ def _settings_payload(context: RequestContext) -> dict:
 
     The raw API key is never part of it: a caller learns whether one is stored
     and which one, never its value.
+
+    `pipeline_defaults` carries the BASE `config/config.json` values - built
+    from `get_config()` directly, with no overrides applied - for every
+    pipeline parameter below. The frontend uses it to show "default: X" next
+    to a field and to placeholder an input the user has not overridden yet;
+    it is not affected by whatever the user has already set.
     """
     config = context.config
+    defaults = get_config()
     return {
         "has_api_key": context.api_key is not None,
         "anthropic_api_key_masked": mask_api_key(context.api_key),
@@ -423,6 +452,18 @@ def _settings_payload(context: RequestContext) -> dict:
         "chaff_ratio": config.synthetic.chaff_ratio,
         "honeytoken_rate": config.synthetic.honeytoken_rate,
         "canaries_per_batch": config.synthetic.canaries_per_batch,
+        "honeytokens_enabled": config.synthetic.honeytokens_enabled,
+        "chaff_enabled": config.synthetic.chaff_enabled,
+        "canaries_enabled": config.synthetic.canaries_enabled,
+        "pipeline_defaults": {
+            "chunk_size_tokens": defaults.chunking.chunk_size_tokens,
+            "chaff_ratio": defaults.synthetic.chaff_ratio,
+            "honeytoken_rate": defaults.synthetic.honeytoken_rate,
+            "canaries_per_batch": defaults.synthetic.canaries_per_batch,
+            "honeytokens_enabled": defaults.synthetic.honeytokens_enabled,
+            "chaff_enabled": defaults.synthetic.chaff_enabled,
+            "canaries_enabled": defaults.synthetic.canaries_enabled,
+        },
     }
 
 

@@ -2271,6 +2271,15 @@
 
     html += '</div>';
 
+    html += '<h3 class="section-title">Pipeline parameters</h3>';
+    html += '<p class="hint">These parameters decide how many synthetic fragments — chaff, honeytokens ' +
+      'and canaries — ride along with the real chunks in every batch. Clear a field to fall back to the ' +
+      'config-file default.</p>';
+    html += '<div class="form-grid">';
+    html += pipelineNumberFieldsHtml(settings);
+    html += pipelineSwitchesHtml(settings);
+    html += '</div>';
+
     html += '<div class="btn-row">';
     html += '<button type="submit" class="btn btn-primary" id="save-settings"' +
       (store.busy.settings ? ' disabled' : '') + '>' +
@@ -2280,20 +2289,59 @@
     html += '</div>';
     html += '</form>';
 
-    html += '<h3 class="section-title">Pipeline parameters (read-only)</h3>';
-    html += '<div class="card"><div class="chips">';
-    html += '<span class="chip"><span class="chip-k">chunk_size_tokens</span><span class="chip-v">' +
-      esc(settings.chunk_size_tokens) + '</span>' + info('chunk_size_tokens') + '</span>';
-    html += '<span class="chip"><span class="chip-k">chaff_ratio</span><span class="chip-v">' +
-      esc(settings.chaff_ratio) + '</span>' + info('chaff_ratio') + '</span>';
-    html += '<span class="chip"><span class="chip-k">honeytoken_rate</span><span class="chip-v">' +
-      esc(settings.honeytoken_rate) + '</span>' + info('honeytoken_rate') + '</span>';
-    html += '<span class="chip"><span class="chip-k">canaries_per_batch</span><span class="chip-v">' +
-      esc(settings.canaries_per_batch) + '</span>' + info('canaries_per_batch') + '</span>';
-    html += '</div></div>';
-
     root.innerHTML = html;
     wireSettings(root);
+  }
+
+  // The four tunable pipeline numbers: each can be overridden or cleared back
+  // to the config-file default (pipeline_defaults from the settings payload).
+  const PIPELINE_NUMBER_FIELDS = [
+    { key: 'chunk_size_tokens', min: 1, step: 1 },
+    { key: 'chaff_ratio', min: 0, step: 0.1 },
+    { key: 'honeytoken_rate', min: 0, step: 0.01 },
+    { key: 'canaries_per_batch', min: 0, step: 1 },
+  ];
+
+  function pipelineNumberFieldsHtml(settings) {
+    const defaults = settings.pipeline_defaults || {};
+    let html = '';
+    PIPELINE_NUMBER_FIELDS.forEach((f) => {
+      const value = settings[f.key] != null ? settings[f.key] : '';
+      const defaultValue = defaults[f.key] != null ? defaults[f.key] : '—';
+      html += '<div class="field"><label for="f-' + f.key + '">' + f.key + info(f.key) + '</label>';
+      html += '<input type="number" id="f-' + f.key + '" name="' + f.key + '" min="' + f.min +
+        '" step="' + f.step + '" value="' + esc(value) + '">';
+      html += '<div class="hint">Default ' + esc(defaultValue) +
+        ' — clear the field to fall back to it.</div></div>';
+    });
+    return html;
+  }
+
+  // The three synthetic mechanisms, each independently switchable. The hint
+  // text mirrors the plain-language GLOSSARY entry for the same concept.
+  const PIPELINE_SWITCHES = [
+    {
+      key: 'honeytokens_enabled', glossary: 'honeytoken',
+      hint: 'Honeytokens are planted fragments with known names, so we can measure how many the detector actually catches (its recall).',
+    },
+    {
+      key: 'chaff_enabled', glossary: 'chaff',
+      hint: 'Chaff adds decoy fragments the provider cannot tell apart from real ones, diluting any copy retained on the other side.',
+    },
+    {
+      key: 'canaries_enabled', glossary: 'canary',
+      hint: 'Canaries seed unique fabricated facts into the traffic — a model repeating one back is evidence of training misuse.',
+    },
+  ];
+
+  function pipelineSwitchesHtml(settings) {
+    let html = '';
+    PIPELINE_SWITCHES.forEach((s) => {
+      html += '<div class="field"><label for="f-' + s.key + '"><input type="checkbox" id="f-' + s.key +
+        '" name="' + s.key + '"' + (settings[s.key] ? ' checked' : '') + '> ' + s.key + info(s.glossary) + '</label>';
+      html += '<div class="hint">' + s.hint + '</div></div>';
+    });
+    return html;
   }
 
   function wireSettings(root) {
@@ -2363,6 +2411,33 @@
         // Never send an empty key: that would clear a stored one by accident.
         const key = keyNode ? keyNode.value : '';
         if (key && key.trim()) body.anthropic_api_key = key.trim();
+
+        // An empty pipeline number field means "clear the override" (the API
+        // resets it to the config-file default on null); anything else must
+        // parse to a number respecting the field's minimum, or the save is
+        // aborted client-side rather than sending garbage to the server.
+        for (const f of PIPELINE_NUMBER_FIELDS) {
+          const node = root.querySelector('#f-' + f.key);
+          const raw = node ? node.value.trim() : '';
+          if (raw === '') {
+            body[f.key] = null;
+            continue;
+          }
+          const num = Number(raw);
+          if (!Number.isFinite(num) || num < f.min) {
+            fail('settings', new Error(f.key + ' must be a number >= ' + f.min + '.'));
+            return;
+          }
+          body[f.key] = num;
+        }
+
+        // Switches always send their current state — there is no "leave
+        // unchanged" concept for a checkbox the way there is for a text field.
+        PIPELINE_SWITCHES.forEach((s) => {
+          const node = root.querySelector('#f-' + s.key);
+          body[s.key] = Boolean(node && node.checked);
+        });
+
         saveSettings(body, 'Settings saved.');
       });
     }
