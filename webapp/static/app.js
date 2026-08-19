@@ -133,6 +133,8 @@
     run: null,               // live streaming run: see startRun()
     redaction: null,         // GET .../redaction payload (+ has_detection, chunk_count, ...)
     redactionDocId: null,
+    storedRun: null,         // GET .../run payload — the persisted run of the active document
+    storedRunDocId: null,
     report: null,
     probePlanned: null,      // how many probe calls the running probe is making
     llmModels: null,         // GET /api/llm-models payload
@@ -149,6 +151,7 @@
       upload: false,
       detect: false,
       redaction: false,
+      storedRun: false,
       report: false,
       probe: false,
       settings: false,
@@ -417,6 +420,10 @@
       store.redaction = null;
       store.redactionDocId = null;
     }
+    if (store.storedRunDocId !== store.doc.doc_id) {
+      store.storedRun = null;
+      store.storedRunDocId = null;
+    }
     updateSidebarDoc();
   }
 
@@ -446,9 +453,20 @@
     return Boolean(store.detect && store.doc && store.detectDocId === store.doc.doc_id);
   }
 
+  /** True when the store holds a persisted run for the active document. */
+  function hasStoredRun() {
+    return Boolean(store.doc && store.storedRun && store.storedRunDocId === store.doc.doc_id &&
+      store.storedRun.has_run === true);
+  }
+
+  /** True when the stored-run answer for the active document has not arrived yet. */
+  function storedRunPending() {
+    return Boolean(store.doc && store.storedRunDocId !== store.doc.doc_id);
+  }
+
   /** True when we know a detection has been recorded for the active document. */
   function detectionKnown() {
-    if (hasRun()) return true;
+    if (hasRun() || hasStoredRun()) return true;
     return Boolean(store.redaction && store.doc && store.redactionDocId === store.doc.doc_id &&
       store.redaction.has_detection === true);
   }
@@ -475,12 +493,13 @@
         break;
       case 'batch':
         if (!hasDoc) locked = { reason: 'Upload a document first', unblock: 'document' };
-        else done = hasRun();
+        else done = hasRun() || hasStoredRun();
         break;
       case 'llm':
         if (!hasDoc) locked = { reason: 'Upload a document first', unblock: 'document' };
-        else if (!hasSubmittedBatch()) locked = { reason: 'Run detection first', unblock: 'batch' };
-        else done = hasRun();
+        else if (!hasSubmittedBatch() && !hasStoredRun()) {
+          locked = { reason: 'Run detection first', unblock: 'batch' };
+        } else done = hasRun() || hasStoredRun();
         break;
       case 'redaction':
         if (!hasDoc) locked = { reason: 'Upload a document first', unblock: 'document' };
@@ -844,6 +863,7 @@
         /* the document list is secondary */
       }
       prefetchRedaction();
+      prefetchStoredRun();
     } catch (err) {
       fail('document', err);
     } finally {
@@ -891,6 +911,7 @@
       adoptDocument(payload);
       toast('info', 'Active document: ' + (store.doc ? store.doc.name : docId));
       prefetchRedaction();
+      prefetchStoredRun();
     } catch (err) {
       fail('document', err);
     }
@@ -1126,6 +1147,85 @@
     return html;
   }
 
+  /**
+   * The persisted run of the active document, rebuilt from the database: what
+   * the Batch step shows when the document was processed in an earlier
+   * session. Only what the run stored can be shown — entities for real
+   * chunks, found names for honeytokens — and the provider-side shuffle order
+   * was never written down, so real chunks come in document order with the
+   * synthetics after them.
+   */
+  function storedRunHtml() {
+    const stored = store.storedRun;
+    const batches = safeArray(stored.batches);
+    const first = batches[0] || {};
+
+    let html = '<div class="card">';
+    html += '<h3 class="card-title">Already processed</h3>';
+    html += '<p class="muted" style="margin:0 0 4px">This document went through detection' +
+      (first.created_at ? ' on ' + esc(fmtDate(first.created_at)) : ' in an earlier session') +
+      ', so there is nothing left to submit. Below is the run as the database remembers it: ' +
+      'every fragment that travelled to the provider and the names that came back for it. ' +
+      'Per-fragment status, latency and the shuffled submission order are kept only for a live run.</p>';
+    html += '<div class="btn-row" style="margin-top:12px">';
+    html += '<a class="btn btn-primary" href="#redaction">See the redacted document</a>';
+    html += '<a class="btn" href="#report">Open the report</a>';
+    html += '</div>';
+    html += '</div>';
+
+    html += '<div class="chips" style="margin:22px 0 12px">';
+    html += '<span class="chip"><span class="chip-k">batch_id</span><span class="chip-v">' +
+      copyId(first.batch_id) + '</span></span>';
+    if (batches.length > 1) {
+      html += '<span class="chip"><span class="chip-k">batches</span><span class="chip-v">' +
+        fmtInt(batches.length) + '</span></span>';
+    }
+    if (first.status) {
+      html += '<span class="chip"><span class="chip-k">status</span><span class="chip-v">' +
+        esc(first.status) + '</span></span>';
+    }
+    html += '<span class="chip"><span class="chip-k">names stored</span><span class="chip-v">' +
+      fmtInt(stored.entities_stored) + '</span></span>';
+    const recall = stored.honeytoken_recall;
+    if (recall && typeof recall === 'object') {
+      html += '<span class="chip"><span class="chip-k">honeytoken recall</span><span class="chip-v">' +
+        fmtPct(recall.recall) + ' (' + fmtInt(recall.found) + '/' + fmtInt(recall.planted) + ')</span></span>';
+    }
+    html += '</div>';
+
+    html += compositionHtml(stored.composition);
+
+    const requests = safeArray(stored.requests);
+    html += '<h3 class="section-title" style="margin:22px 0 12px">Stored fragments (' +
+      fmtInt(requests.length) + ')</h3>';
+    if (!requests.length) {
+      html += emptyState('No fragments', 'The stored run carried no fragments.');
+      return html;
+    }
+    html += '<div class="frag-list">';
+    requests.forEach((req) => {
+      const kind = String(req.kind || 'unknown');
+      html += '<div class="frag frag-kind-' + esc(kindClass(kind)) + '">';
+      html += '<div class="frag-meta">' + kindBadge(kind);
+      if (req.seq !== null && req.seq !== undefined) {
+        html += '<span class="frag-seq">seq ' + esc(req.seq) + '</span>';
+      }
+      html += '</div>';
+      html += '<div>' + copyId(req.custom_id) + '</div>';
+      html += '<div class="frag-text">' + esc(req.text || '') + '</div>';
+      // `entities` is null for chaff and canaries: no answer about them is
+      // ever kept, which is different from "answered with no names".
+      if (Array.isArray(req.entities)) {
+        html += req.entities.length
+          ? '<div class="ent-list" style="margin-top:8px">' + req.entities.map(entityHtml).join('') + '</div>'
+          : '<div class="muted" style="margin-top:8px">no names reported</div>';
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
   function renderBatch(root) {
     const hasDoc = Boolean(store.doc);
     const settings = store.settings || {};
@@ -1150,6 +1250,16 @@
 
     if (store.run) {
       html += runPanelHtml();
+    } else if (!store.detect && storedRunPending()) {
+      // Whether this document was processed in an earlier session is not
+      // known yet; asking now avoids flashing a run button that could only
+      // answer "no unsubmitted chunks".
+      prefetchStoredRun();
+      html += '<div class="card"><h3 class="card-title">Run detection</h3>' +
+        '<p class="muted" style="margin:0"><span class="spinner"></span>' +
+        'Checking whether this document was already processed…</p></div>';
+    } else if (!store.detect && hasStoredRun()) {
+      html += storedRunHtml();
     } else {
       html += '<div class="card">';
       html += '<h3 class="card-title">Run detection</h3>';
@@ -1433,6 +1543,8 @@
         store.redaction = null;
         store.redactionDocId = null;
         store.report = null;
+        store.storedRun = null;
+        store.storedRunDocId = null;
 
         run.phase = 'done';
         run.detail = '';
@@ -1529,6 +1641,12 @@
 
   async function runDetect() {
     if (!store.doc || store.busy.detect) return;
+    if (hasStoredRun()) {
+      // The server would only answer 409: everything is already submitted.
+      setAlert('batch', 'info', 'This document was already processed — the stored run is shown below.');
+      render();
+      return;
+    }
 
     clearAlert('batch');
     store.busy.detect = true;
@@ -1573,6 +1691,19 @@
         raw = await res.text();
       } catch (err) {
         raw = '';
+      }
+      if (res.status === 409) {
+        // "No unsubmitted chunks": the document was processed in an earlier
+        // session. That is a state to show, not an error to report.
+        store.run = null;
+        store.busy.detect = false;
+        stopRunTimer();
+        store.storedRun = null;
+        store.storedRunDocId = null;
+        setAlert('batch', 'info',
+          'This document was already processed — showing the stored run instead.');
+        prefetchStoredRun();
+        return;
       }
       abortRun(errorDetail(raw, res, '/api/detect'));
       return;
@@ -1631,8 +1762,9 @@
       const priorRun = Boolean(store.redaction && store.redaction.has_detection);
       if (priorRun) {
         root.innerHTML = html + emptyState('Nothing to inspect in this session',
-          'This document already has detection results stored, but the request and response detail is only kept for a run made in this browser session. Run detection again to inspect the exchange.',
-          '<a class="btn btn-primary" href="#batch">Go to Batch</a>' +
+          'This document already has detection results stored — the Batch step shows the run as the database remembers it. ' +
+          'The full request and response detail, however, is only kept for a run made in this browser session.',
+          '<a class="btn btn-primary" href="#batch">See the stored run</a>' +
           '<a class="btn" href="#redaction">See the redacted document</a>');
       } else {
         root.innerHTML = html + emptyState('No detection run yet',
@@ -1927,6 +2059,35 @@
       }
     } catch (err) {
       /* silent: the Redaction view will report the failure if the user goes there */
+    }
+  }
+
+  /**
+   * Quietly learn whether the active document was already submitted in an
+   * earlier session, so the Batch step can show the stored run instead of a
+   * run button that could only be answered with "no unsubmitted chunks".
+   */
+  async function prefetchStoredRun() {
+    if (!store.doc || store.busy.storedRun) return;
+    const docId = store.doc.doc_id;
+    store.busy.storedRun = true;
+    try {
+      const data = await api('/api/documents/' + encodeURIComponent(docId) + '/run');
+      if (store.doc && store.doc.doc_id === docId) {
+        store.storedRun = data;
+        store.storedRunDocId = docId;
+      }
+    } catch (err) {
+      // Remember the failure as "no stored run" for this document: rendering
+      // the Batch view must not refetch in a loop, and the run button is a
+      // sane fallback.
+      if (store.doc && store.doc.doc_id === docId) {
+        store.storedRun = null;
+        store.storedRunDocId = docId;
+      }
+    } finally {
+      store.busy.storedRun = false;
+      render();
     }
   }
 
