@@ -119,7 +119,7 @@
     anthropic: 'Paste a valid key into the Anthropic API key field above and save.',
     local_llm: 'Start the local model server (for example: ollama serve) and pull the configured model, or pick "Deterministic templates" as the synthetic prose generator.',
     markitdown: 'Install the markitdown package into the server environment.',
-    conversion: 'Start the external conversion service, or clear conversion.service_url in config/config.json to use the built-in converter.',
+    conversion: 'Start the external conversion service, or empty the "Conversion service URL" field below and save to use the built-in converter.',
     database: 'Check that the data directory exists and is writable by the server process.',
   };
 
@@ -2263,6 +2263,12 @@
     html += '<div class="field"><label for="f-base">Local LLM base URL</label>';
     html += '<input type="text" id="f-base" name="llm_base_url" value="' + esc(settings.llm_base_url || '') + '"></div>';
 
+    html += '<div class="field" style="grid-column:1/-1"><label for="f-conversion">Conversion service URL</label>';
+    html += '<input type="text" id="f-conversion" name="conversion_service_url" value="' +
+      esc(settings.conversion_service_url || '') + '" placeholder="empty = built-in markitdown">';
+    html += '<div class="hint">URL of a doc_converter instance (see github.com/padak/doc_converter) - better PDF ' +
+      'extraction via PyMuPDF. Leave empty to convert with the built-in markitdown.</div></div>';
+
     html += '</div>';
 
     html += '<div class="btn-row">';
@@ -2329,6 +2335,7 @@
         const modelNode = root.querySelector('#f-model');
         const effortNode = root.querySelector('#f-effort');
         const baseNode = root.querySelector('#f-base');
+        const conversionNode = root.querySelector('#f-conversion');
         const llmModelNode = root.querySelector('#f-llm-model');
         const pickedNode = root.querySelector('input[name="llm-choice"]:checked');
         const keyNode = root.querySelector('#f-key');
@@ -2337,6 +2344,9 @@
           model: modelNode ? (modelNode.value || '').trim() : '',
           effort: effortNode ? effortNode.value : '',
           llm_base_url: baseNode ? (baseNode.value || '').trim() : '',
+          // Always sent, empty included: an empty field is the user choosing
+          // the built-in converter, not a field they left alone.
+          conversion_service_url: conversionNode ? (conversionNode.value || '').trim() : '',
         };
 
         // Templates leave llm_model alone: the model a user picked earlier is

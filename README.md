@@ -39,7 +39,56 @@ flowchart LR
 Chunking is lossless by construction: token slices are cut via `decode_bytes`
 and the boundary is extended whenever a cut would split a multi-byte UTF-8
 character, so `"".join(chunks) == original` holds for any input (verified for
-Czech diacritics, emoji and CJK).
+Czech diacritics, emoji and CJK). Emails and URLs are redacted
+deterministically by regex before the entity pass — they never need the LLM.
+
+## Web console
+
+```bash
+.venv/bin/uvicorn webapp.server:app --port 8801
+```
+
+Every pipeline step is observable in a local web console: upload and
+conversion, token-level chunk view, batch composition, exact LLM payloads and
+responses, redaction diff, recall report and canary probes. API keys are
+entered in Settings and stored only in the gitignored `data/settings.json`,
+echoed back masked.
+
+The redacted result — names, companies, emails and URLs replaced, reassembled
+byte-exactly from the chunks:
+
+![Redaction view](docs/screenshots/07-redaction.png)
+
+The document as it is actually stored — token boundaries visible, with a cut
+that moved to keep a name whole:
+
+![Chunks view](docs/screenshots/02-chunks.png)
+
+Detection streams its progress live — synthetic generation, submission, one
+line per provider call:
+
+![Live detection progress](docs/screenshots/03-live-progress.png)
+
+The core reveal is the Local / Provider toggle on the submitted batch. Local
+view is what only you know:
+
+![Batch local view](docs/screenshots/04-batch-local.png)
+
+Provider view is everything the provider can see — shuffled fragments under
+opaque IDs, roughly half of them synthetic, no ordering, no labels:
+
+![Batch provider view](docs/screenshots/05-batch-provider.png)
+
+<details>
+<summary>More screenshots: upload, LLM I/O, report</summary>
+
+![Document view](docs/screenshots/01-document.png)
+
+![LLM I/O view](docs/screenshots/06-llm-io.png)
+
+![Report view](docs/screenshots/08-report.png)
+
+</details>
 
 ## Canaries and chaff
 
@@ -133,11 +182,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn converter.server:app --port 8802
 ```
 
-Then set `conversion.service_url` to `http://localhost:8802` in
-`config/config.json`. With the URL empty, uploads use the built-in
-markitdown converter (weaker PDF word spacing). The Verify setup button in
-Settings reports the service's health, and any service implementing the same
-`/convert` + `/health` contract is a drop-in replacement.
+Then set the Conversion service URL to `http://localhost:8802` in the web
+console's Settings (persisted to `data/settings.json`), or as
+`conversion.service_url` in `config/config.json`. With the URL empty, uploads
+use the built-in markitdown converter (weaker PDF word spacing). The Verify
+setup button in Settings reports the service's health, and any service
+implementing the same `/convert` + `/health` contract is a drop-in
+replacement.
 
 ## Usage
 
