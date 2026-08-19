@@ -87,7 +87,7 @@ Companion repo: [doc_converter](https://github.com/padak/doc_converter)
 
 ## Dev workflow
 
-- venv at `.venv`; `.venv/bin/pytest -q` (368 tests, all offline — fakes for
+- venv at `.venv`; `.venv/bin/pytest -q` (426 tests, all offline — fakes for
   Anthropic, local LLM, conversion service); `node --check webapp/static/app.js`.
 - `requirements.txt` holds **direct deps with lower bounds only** — never
   `pip freeze` (breaks Python 3.9 colleagues); verified 3.9–3.14.

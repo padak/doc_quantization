@@ -125,7 +125,7 @@ Requires **Python 3.9 or newer** (verified on 3.9, 3.11, 3.13 and 3.14).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q          # 378 tests should pass
+.venv/bin/pytest -q          # 426 tests should pass
 ```
 
 On macOS, `python3` may point at the system interpreter shipped with Xcode,
