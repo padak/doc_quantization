@@ -491,3 +491,45 @@ def test_database_from_the_old_schema_gains_the_new_tables(tmp_path: Path) -> No
         assert len(store.list_canary_probes()) == 1
     finally:
         store.close()
+
+
+# ----------------------------------------------------------------------
+# per-batch getters (used to reconstruct a stored run for the web app)
+# ----------------------------------------------------------------------
+
+
+def test_get_batch_synthetic_fragments_returns_only_that_batch(store: ChunkStore) -> None:
+    store.add_synthetic_fragments([HONEYTOKEN, CHAFF, CANARY])
+    store.mark_synthetic_submitted(["frag_honey", "frag_chaff"], "batch-1")
+    store.mark_synthetic_submitted(["frag_canary"], "batch-2")
+
+    fragments = store.get_batch_synthetic_fragments("batch-1")
+
+    assert {fragment["fragment_id"] for fragment in fragments} == {
+        "frag_honey",
+        "frag_chaff",
+    }
+    # `planted` comes back decoded, exactly like the other fragment getters.
+    by_id = {fragment["fragment_id"]: fragment for fragment in fragments}
+    assert by_id["frag_honey"]["planted"] == HONEYTOKEN["planted"]
+
+
+def test_get_batch_synthetic_fragments_of_unknown_batch_is_empty(
+    store: ChunkStore,
+) -> None:
+    assert store.get_batch_synthetic_fragments("nope") == []
+
+
+def test_get_batch_honeytoken_found_maps_fragments_to_reported_names(
+    store: ChunkStore,
+) -> None:
+    store.add_synthetic_fragments([HONEYTOKEN, CHAFF])
+    store.mark_synthetic_submitted(["frag_honey", "frag_chaff"], "batch-1")
+    store.record_honeytoken_result(
+        "frag_honey", "batch-1", [("Torvald Grimsbury", "person")]
+    )
+
+    assert store.get_batch_honeytoken_found("batch-1") == {
+        "frag_honey": [("Torvald Grimsbury", "person")]
+    }
+    assert store.get_batch_honeytoken_found("batch-2") == {}

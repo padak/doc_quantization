@@ -480,6 +480,109 @@ def read_document(
     }
 
 
+@app.get("/api/documents/{doc_id}/run")
+def read_stored_run(
+    doc_id: str,
+    store: ChunkStore = Depends(store_dependency),
+) -> dict:
+    """Reconstruct the recorded detection run of a document from the store.
+
+    This is what the Batch view shows for a document whose chunks were
+    submitted in an earlier session. Only what a run persists can come back:
+    the fragments with their stored answers - entities for real chunks, found
+    names for honeytokens, nothing for chaff and canaries - but no per-fragment
+    status or latency, and no submission order, which was shuffled for the
+    provider and never written down. Real chunks therefore come in document
+    order with the synthetics after them.
+    """
+    _require_document(store, doc_id)
+    chunks = store.get_document_chunks(doc_id)
+    submitted = [chunk for chunk in chunks if chunk["batch_id"] is not None]
+
+    payload = {
+        "has_run": bool(submitted),
+        "chunk_count": len(chunks),
+        "chunks_submitted": len(submitted),
+        "batches": [],
+        "composition": None,
+        "requests": [],
+        "entities_stored": 0,
+        "honeytoken_recall": None,
+    }
+    if not submitted:
+        return payload
+
+    # The webapp submits a whole document into one sync batch, but the CLI may
+    # split an unlucky document across several; every batch it touched counts.
+    batch_ids = list(dict.fromkeys(chunk["batch_id"] for chunk in submitted))
+    known_batches = {batch["batch_id"]: batch for batch in store.list_batches()}
+    payload["batches"] = [
+        known_batches.get(
+            batch_id, {"batch_id": batch_id, "status": None, "created_at": None}
+        )
+        for batch_id in batch_ids
+    ]
+
+    entities_by_chunk = store.get_document_entities_by_chunk(doc_id)
+    requests = [
+        {
+            "custom_id": chunk["chunk_id"],
+            "kind": KIND_REAL,
+            "seq": chunk["seq"],
+            "text": chunk["text"],
+            "entities": _entity_payloads(entities_by_chunk.get(chunk["chunk_id"], [])),
+        }
+        for chunk in submitted
+    ]
+
+    composition = Counter({KIND_REAL: len(submitted)})
+    planted_total = 0
+    found_total = 0
+    saw_honeytoken = False
+    for batch_id in batch_ids:
+        found_by_fragment = store.get_batch_honeytoken_found(batch_id)
+        for fragment in store.get_batch_synthetic_fragments(batch_id):
+            composition[fragment["kind"]] += 1
+            entities = None
+            if fragment["kind"] == KIND_HONEYTOKEN:
+                saw_honeytoken = True
+                found = found_by_fragment.get(fragment["fragment_id"])
+                if found is not None:
+                    entities = _entity_payloads(found)
+                # Recall is scored exactly like the live run and
+                # `honeytoken_stats`: a planted name counts when its text came
+                # back, whatever type the provider gave it.
+                found_names = {name for name, _ in (found or [])}
+                planted_total += len(fragment["planted"])
+                found_total += sum(
+                    1 for name, _ in fragment["planted"] if name in found_names
+                )
+            requests.append(
+                {
+                    "custom_id": fragment["fragment_id"],
+                    "kind": fragment["kind"],
+                    "seq": None,
+                    "text": fragment["text"],
+                    "entities": entities,
+                }
+            )
+
+    payload["requests"] = requests
+    payload["composition"] = {
+        kind: composition[kind] for kind in (KIND_REAL, *SYNTHETIC_KINDS)
+    }
+    payload["entities_stored"] = sum(
+        len(pairs) for pairs in entities_by_chunk.values()
+    )
+    if saw_honeytoken:
+        payload["honeytoken_recall"] = {
+            "planted": planted_total,
+            "found": found_total,
+            "recall": found_total / planted_total if planted_total else 0.0,
+        }
+    return payload
+
+
 @app.get("/api/documents/{doc_id}/redaction")
 def read_redaction(
     doc_id: str,
@@ -494,6 +597,8 @@ def read_redaction(
     removed.
     """
     _require_document(store, doc_id)
+    chunks = store.get_document_chunks(doc_id)
+    chunks_submitted = sum(1 for chunk in chunks if chunk["batch_id"] is not None)
     original = store.reconstruct(doc_id)
     entities = store.get_document_entities(doc_id)
     redacted = redact_text(
@@ -517,6 +622,11 @@ def read_redaction(
         "original": original,
         "redacted": redacted,
         "entities": payloads,
+        # Detection state: the frontend uses it to tell "nothing ran yet"
+        # apart from "detection ran and found nothing".
+        "has_detection": chunks_submitted > 0,
+        "chunk_count": len(chunks),
+        "chunks_submitted": chunks_submitted,
     }
 
 

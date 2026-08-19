@@ -315,3 +315,28 @@ def test_add_entities_unknown_chunk_raises_key_error(store: ChunkStore) -> None:
 
 def test_get_document_entities_of_unknown_document_is_empty(store: ChunkStore) -> None:
     assert store.get_document_entities("nope") == []
+
+
+def test_get_document_entities_by_chunk_groups_per_chunk(store: ChunkStore) -> None:
+    doc_id = store.add_document("doc.md", CHUNKS)
+    chunks = store.get_document_chunks(doc_id)
+    store.add_entities(chunks[1]["chunk_id"], [("Petr Novák", "person")])
+    store.add_entities(chunks[2]["chunk_id"], [("Keboola s.r.o.", "company")])
+
+    grouped = store.get_document_entities_by_chunk(doc_id)
+
+    assert grouped == {
+        chunks[1]["chunk_id"]: [("Petr Novák", "person")],
+        chunks[2]["chunk_id"]: [("Keboola s.r.o.", "company")],
+    }
+
+
+def test_get_document_entities_by_chunk_ignores_other_documents(
+    store: ChunkStore,
+) -> None:
+    doc_id = store.add_document("doc.md", CHUNKS)
+    other_id = store.add_document("other.md", OTHER_CHUNKS)
+    other_chunk = store.get_document_chunks(other_id)[0]["chunk_id"]
+    store.add_entities(other_chunk, [("Jane Doe", "person")])
+
+    assert store.get_document_entities_by_chunk(doc_id) == {}

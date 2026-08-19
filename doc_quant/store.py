@@ -362,6 +362,30 @@ class ChunkStore:
         )
         return [(row["text"], row["type"]) for row in cursor.fetchall()]
 
+    def get_document_entities_by_chunk(
+        self, doc_id: str
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Return each chunk's stored (text, type) entities, keyed by chunk id.
+
+        Chunks without any stored entity are absent from the mapping. Within a
+        chunk the pairs keep their insertion order, which is the order the
+        provider reported them in.
+        """
+        cursor = self._connection.execute(
+            """
+            SELECT e.chunk_id AS chunk_id, e.text AS text, e.type AS type
+            FROM entities e
+            JOIN chunks c ON c.chunk_id = e.chunk_id
+            WHERE c.doc_id = ?
+            ORDER BY e.chunk_id, e.id
+            """,
+            (doc_id,),
+        )
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for row in cursor.fetchall():
+            grouped.setdefault(row["chunk_id"], []).append((row["text"], row["type"]))
+        return grouped
+
     # ------------------------------------------------------------------
     # synthetic fragments
     # ------------------------------------------------------------------
@@ -454,9 +478,35 @@ class ChunkStore:
                 batch_id,
             )
 
+    def get_batch_synthetic_fragments(self, batch_id: str) -> list[dict]:
+        """Return the synthetic fragments submitted in `batch_id`, oldest first."""
+        cursor = self._connection.execute(
+            f"SELECT {_SYNTHETIC_COLUMNS} FROM synthetic_fragments "
+            "WHERE batch_id = ? ORDER BY created_at, fragment_id",
+            (batch_id,),
+        )
+        return [_synthetic_row_to_dict(row) for row in cursor.fetchall()]
+
     # ------------------------------------------------------------------
     # honeytoken results
     # ------------------------------------------------------------------
+
+    def get_batch_honeytoken_found(
+        self, batch_id: str
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Return what the provider reported per honeytoken of `batch_id`.
+
+        Keyed by fragment id; a honeytoken the provider was never asked about
+        (or answered outside this batch) is absent.
+        """
+        cursor = self._connection.execute(
+            "SELECT fragment_id, found FROM honeytoken_results "
+            "WHERE batch_id = ? ORDER BY id",
+            (batch_id,),
+        )
+        return {
+            row["fragment_id"]: _load_pairs(row["found"]) for row in cursor.fetchall()
+        }
 
     def record_honeytoken_result(
         self, fragment_id: str, batch_id: str, found: list[tuple[str, str]]

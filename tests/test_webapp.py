@@ -1346,6 +1346,106 @@ def test_redaction_removes_emails_without_any_detection(harness):
 
 
 # ---------------------------------------------------------------------------
+# stored run
+# ---------------------------------------------------------------------------
+
+
+def stored_run(harness: Harness, doc_id: str) -> dict:
+    response = harness.client.get(f"/api/documents/{doc_id}/run")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def sorted_entities(entities: list[dict]) -> list[dict]:
+    return sorted(entities, key=lambda item: (item["text"], item["type"]))
+
+
+def test_stored_run_is_empty_before_detection(harness):
+    document = upload_markdown(harness)
+
+    payload = stored_run(harness, document["doc_id"])
+
+    assert payload["has_run"] is False
+    assert payload["chunk_count"] == len(document["chunks"])
+    assert payload["chunks_submitted"] == 0
+    assert payload["batches"] == []
+    assert payload["requests"] == []
+    assert payload["composition"] is None
+    assert payload["entities_stored"] == 0
+    assert payload["honeytoken_recall"] is None
+
+
+def test_stored_run_reconstructs_a_finished_run(harness):
+    document = upload_markdown(harness)
+    expected = arm_provider(harness, document)
+    result = detect(harness, document["doc_id"])
+
+    payload = stored_run(harness, document["doc_id"])
+
+    assert payload["has_run"] is True
+    assert payload["chunk_count"] == len(document["chunks"])
+    assert payload["chunks_submitted"] == len(document["chunks"])
+    assert [batch["batch_id"] for batch in payload["batches"]] == [result["batch_id"]]
+    assert payload["batches"][0]["status"] == "sync-completed"
+    assert payload["composition"] == result["composition"]
+    assert payload["entities_stored"] == result["entities_stored"]
+    assert payload["honeytoken_recall"] == result["honeytoken_recall"]
+
+    # Real chunks come back in document order with the synthetics after them:
+    # the provider-order shuffle of the live run is never persisted, so the
+    # stored run makes no claim about it.
+    requests = payload["requests"]
+    real = [item for item in requests if item["kind"] == "real"]
+    assert [item["seq"] for item in real] == list(range(len(document["chunks"])))
+
+    by_id = {item["custom_id"]: item for item in requests}
+    for chunk in document["chunks"]:
+        entry = by_id[chunk["chunk_id"]]
+        assert entry["text"] == chunk["text"]
+        expected_entities = [
+            {"text": text, "type": kind}
+            for text, kind in expected.get(chunk["text"], [])
+        ]
+        assert sorted_entities(entry["entities"]) == sorted_entities(expected_entities)
+
+    for fragment in harness.synthetic(KIND_HONEYTOKEN):
+        entry = by_id[fragment.fragment_id]
+        assert entry["kind"] == KIND_HONEYTOKEN
+        assert entry["seq"] is None
+        assert entry["entities"] == [
+            {"text": text, "type": kind} for text, kind in HONEYTOKEN_REPORTED
+        ]
+    # Chaff dilutes and canaries wait to be probed; neither has an answer that
+    # the run keeps, and the payload says so with null rather than [].
+    for fragment in harness.synthetic(KIND_CHAFF) + harness.synthetic(KIND_CANARY):
+        assert by_id[fragment.fragment_id]["entities"] is None
+
+
+def test_stored_run_on_an_unknown_document_is_a_404(harness):
+    response = harness.client.get("/api/documents/nope/run")
+
+    assert response.status_code == 404
+
+
+def test_redaction_reports_detection_state(harness):
+    document = upload_markdown(harness)
+    doc_id = document["doc_id"]
+
+    before = harness.client.get(f"/api/documents/{doc_id}/redaction").json()
+    assert before["has_detection"] is False
+    assert before["chunk_count"] == len(document["chunks"])
+    assert before["chunks_submitted"] == 0
+
+    arm_provider(harness, document)
+    detect(harness, doc_id)
+
+    after = harness.client.get(f"/api/documents/{doc_id}/redaction").json()
+    assert after["has_detection"] is True
+    assert after["chunk_count"] == len(document["chunks"])
+    assert after["chunks_submitted"] == len(document["chunks"])
+
+
+# ---------------------------------------------------------------------------
 # synthetic report
 # ---------------------------------------------------------------------------
 
