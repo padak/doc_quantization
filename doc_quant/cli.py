@@ -7,6 +7,12 @@ the chunks for detection, fetch the results, then write out redacted copies.
 The `chunk get` / `chunk set` pair exists so a single fragment can be handed to
 an outside processor and the transformed text put back under the same id.
 
+Which of the two detection backends those middle commands belong to is decided
+by `detection.provider`: `submit`/`status <id>`/`fetch` drive the Anthropic
+Batches API, while `detect` runs the chunks through a local model server in one
+synchronous pass. The dispatcher refuses the commands of the other backend
+rather than quietly doing the wrong thing with the operator's data.
+
 Two further commands cover the synthetic fragments that ride along with every
 batch: `synthetic-report` reads back what was measured (offline), and
 `canary-probe` asks a model about the invented canary people to see whether a
@@ -27,6 +33,8 @@ import anthropic
 
 from doc_quant.chunker import Chunker
 from doc_quant.config import (
+    DETECTION_PROVIDER_ANTHROPIC,
+    DETECTION_PROVIDER_LOCAL,
     AppConfig,
     ConfigError,
     load_config,
@@ -34,6 +42,20 @@ from doc_quant.config import (
     require_api_key,
 )
 from doc_quant.detector import KIND_CANARY, Detector
+
+# Imported as names on this module - rather than used through the module - so
+# that the local backend can be swapped for a stand-in in tests without a live
+# model server anywhere near the CLI.
+from doc_quant.local_detector import (
+    LOCAL_BATCH_STATUS_COMPLETED,
+    LOCAL_BATCH_STATUS_RUNNING,
+    STATUS_OK as LOCAL_STATUS_OK,
+    build_local_payload_template,
+    detect_local,
+    get_local_client,
+    new_local_batch_id,
+    probe_local_server,
+)
 from doc_quant.redactor import redact_text
 from doc_quant.store import ChunkStore
 from doc_quant.synthetic import CANARY_FACT_MARKER, LocalLLMError
@@ -102,6 +124,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("submit", help="Send unsubmitted chunks to the Batches API.")
+
+    subparsers.add_parser(
+        "detect",
+        help="Detect names locally over unsubmitted chunks (detection.provider=local).",
+    )
 
     status = subparsers.add_parser("status", help="Show batch status.")
     status.add_argument("batch_id", nargs="?", help="Omit to list all known batches.")
@@ -198,6 +225,66 @@ def _cmd_submit(detector: Detector) -> int:
         print("nothing to submit")
         return 0
     print(f"Submitted batch {batch_id}")
+    return 0
+
+
+def _cmd_detect(config: AppConfig, store: ChunkStore) -> int:
+    """Run local detection over every not-yet-submitted chunk, synchronously.
+
+    Local mode sends nothing off the machine, so there is no mixing, no
+    shuffle and no synthetic traffic: the chunks go to the configured local
+    endpoint as-is and the entities land in the same table the remote paths
+    fill. Workers only send HTTP requests; every store write happens on this
+    thread via `as_completed`, because the SQLite connection belongs to the
+    thread that opened it.
+    """
+    # Before any store write, so an unreachable server leaves the document
+    # exactly as it was rather than stranding its chunks in a dead batch.
+    probe_local_server(config)
+
+    chunks = store.get_unsubmitted_chunks()
+    if not chunks:
+        print("nothing to detect")
+        return 0
+
+    client = get_local_client(config)
+    template = build_local_payload_template(config)
+
+    batch_id = new_local_batch_id()
+    store.record_batch(batch_id, LOCAL_BATCH_STATUS_RUNNING)
+    store.mark_chunks_submitted([chunk["chunk_id"] for chunk in chunks], batch_id)
+
+    ok = errored = entities_stored = dropped = 0
+    workers = max(1, config.detection.local.concurrency)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(detect_local, client, template, chunk["text"]): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
+            chunk = futures[future]
+            outcome = future.result()
+            if outcome.status == LOCAL_STATUS_OK:
+                store.add_entities(chunk["chunk_id"], outcome.entities)
+                ok += 1
+                entities_stored += len(outcome.entities)
+                dropped += outcome.dropped
+            else:
+                errored += 1
+                logger.warning(
+                    "Chunk %s errored: %s", chunk["chunk_id"], outcome.detail
+                )
+    finally:
+        # A caller that gives up must not keep the run going: whatever is still
+        # queued is dropped rather than waited for.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    store.set_batch_status(batch_id, LOCAL_BATCH_STATUS_COMPLETED)
+    print(
+        f"Detected batch {batch_id}: chunks={len(chunks)} ok={ok} "
+        f"errored={errored} entities={entities_stored} dropped={dropped}"
+    )
     return 0
 
 
@@ -549,6 +636,30 @@ def _cmd_canary_probe(args: argparse.Namespace, config: AppConfig, store: ChunkS
     return 0
 
 
+def _require_provider(config: AppConfig, wanted: str, command: str) -> None:
+    """Refuse a command whose backend the config has switched away from.
+
+    A machine configured local must not send data out by habit, and `detect`
+    on an anthropic-configured machine would silently bypass the mixing
+    pipeline - both are configuration mistakes worth a hard stop.
+
+    Raises:
+        ConfigError: when the configured provider is not `wanted`.
+    """
+    actual = config.detection.provider
+    if actual == wanted:
+        return
+    if actual == DETECTION_PROVIDER_LOCAL:
+        raise ConfigError(
+            f"detection.provider is 'local'; `{command}` talks to the Anthropic "
+            "API. Use `detect`, or switch detection.provider back to 'anthropic'."
+        )
+    raise ConfigError(
+        "detection.provider is 'anthropic'; `detect` runs locally only. "
+        "Use `submit`/`status`/`fetch`, or switch detection.provider to 'local'."
+    )
+
+
 def _dispatch(args: argparse.Namespace) -> int:
     config = load_config()
     store = ChunkStore(config.database.path)
@@ -571,11 +682,20 @@ def _dispatch(args: argparse.Namespace) -> int:
         if args.command == "reconstruct":
             return _cmd_reconstruct(args, store)
         if args.command == "submit":
+            _require_provider(config, DETECTION_PROVIDER_ANTHROPIC, "submit")
             return _cmd_submit(detector)
         if args.command == "status":
+            # Only a per-batch status call reaches the API; listing batches is
+            # offline, and local runs are batches too, so they stay listable.
+            if args.batch_id:
+                _require_provider(config, DETECTION_PROVIDER_ANTHROPIC, "status")
             return _cmd_status(args, store, detector)
         if args.command == "fetch":
+            _require_provider(config, DETECTION_PROVIDER_ANTHROPIC, "fetch")
             return _cmd_fetch(args, detector)
+        if args.command == "detect":
+            _require_provider(config, DETECTION_PROVIDER_LOCAL, "detect")
+            return _cmd_detect(config, store)
         if args.command == "redact":
             return _cmd_redact(args, store, config)
         if args.command == "synthetic-report":
