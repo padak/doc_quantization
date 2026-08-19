@@ -117,6 +117,28 @@ OpenAI-compatible endpoint — for example [Ollama](https://ollama.com)
 Point `synthetic.llm.base_url` in `config/config.json` at it. Without one,
 commands fail fast with an actionable message.
 
+## Conversion service (recommended)
+
+For high-quality PDF extraction, pair this app with its companion project
+[doc_converter](https://github.com/padak/doc_converter) — a small AGPL-3.0
+HTTP service whose PDF engine (PyMuPDF) fixes the glued-words artifacts of
+the built-in converter. It lives in a separate repository on purpose: the
+AGPL engine stays behind a generic HTTP boundary, so this repository remains
+pure Apache-2.0.
+
+```bash
+git clone https://github.com/padak/doc_converter
+cd doc_converter
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn converter.server:app --port 8802
+```
+
+Then set `conversion.service_url` to `http://localhost:8802` in
+`config/config.json`. With the URL empty, uploads use the built-in
+markitdown converter (weaker PDF word spacing). The Verify setup button in
+Settings reports the service's health, and any service implementing the same
+`/convert` + `/health` contract is a drop-in replacement.
+
 ## Usage
 
 ```bash
