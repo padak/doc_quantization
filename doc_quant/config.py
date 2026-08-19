@@ -77,6 +77,36 @@ class AnthropicConfig:
     detect_concurrency: int
 
 
+DETECTION_PROVIDER_ANTHROPIC = "anthropic"
+DETECTION_PROVIDER_LOCAL = "local"
+VALID_DETECTION_PROVIDERS = frozenset(
+    {DETECTION_PROVIDER_ANTHROPIC, DETECTION_PROVIDER_LOCAL}
+)
+
+
+@dataclass(frozen=True)
+class LocalDetectionConfig:
+    """Local OpenAI-compatible endpoint used when detection.provider is "local".
+
+    Deliberately separate from synthetic.llm: the detection model and the
+    prose model may differ, and switching the provider must not silently
+    repoint the synthetic pipeline.
+    """
+
+    base_url: str
+    model: str
+    timeout_seconds: float
+    concurrency: int
+
+
+@dataclass(frozen=True)
+class DetectionConfig:
+    """Which backend detection requests go to."""
+
+    provider: str
+    local: LocalDetectionConfig
+
+
 @dataclass(frozen=True)
 class RedactionConfig:
     person: str
@@ -152,6 +182,7 @@ class AppConfig:
     database: DatabaseConfig
     conversion: ConversionConfig
     anthropic: AnthropicConfig
+    detection: DetectionConfig
     redaction: RedactionConfig
     synthetic: SyntheticConfig
 
@@ -191,6 +222,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         "anthropic",
         "redaction",
         "synthetic",
+        "detection",
     ):
         if section not in raw:
             raise ConfigError(f"Missing required config section: {section}")
@@ -222,14 +254,45 @@ def load_config(path: Path | None = None) -> AppConfig:
         url=_require(raw["redaction"], "url", "redaction"),
     )
     synthetic = _load_synthetic(raw["synthetic"])
+    detection = _load_detection(raw["detection"])
     return AppConfig(
         chunking=chunking,
         database=database,
         conversion=conversion,
         anthropic=anthropic_cfg,
+        detection=detection,
         redaction=redaction,
         synthetic=synthetic,
     )
+
+
+def _load_detection(raw: dict) -> DetectionConfig:
+    """Build the detection section, failing fast on any missing key.
+
+    The provider is validated here rather than where it is first used, so a
+    typo cannot select the remote backend by accident at detection time.
+    """
+    provider = _require(raw, "provider", "detection")
+    if provider not in VALID_DETECTION_PROVIDERS:
+        raise ConfigError(
+            f"Config key detection.provider must be one of "
+            f"{sorted(VALID_DETECTION_PROVIDERS)}, got {provider!r}"
+        )
+    raw_local = _require(raw, "local", "detection")
+    if not isinstance(raw_local, dict):
+        raise ConfigError(
+            f"Config key detection.local must be an object, "
+            f"got {type(raw_local).__name__}"
+        )
+    local = LocalDetectionConfig(
+        base_url=_require(raw_local, "base_url", "detection.local"),
+        model=_require(raw_local, "model", "detection.local"),
+        timeout_seconds=float(
+            _require(raw_local, "timeout_seconds", "detection.local")
+        ),
+        concurrency=int(_require(raw_local, "concurrency", "detection.local")),
+    )
+    return DetectionConfig(provider=provider, local=local)
 
 
 def _load_conversion(raw: dict) -> ConversionConfig:
